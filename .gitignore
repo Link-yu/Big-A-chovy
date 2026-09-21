@@ -38,6 +38,8 @@ daily-stock-analysis/scripts/holdings.json
 daily-stock-analysis/scripts/gui_settings.json
 daily-stock-analysis/scripts/.em_nontrading_refresh
 tools/shadow_data/shadow_samples.json
+# 模拟盘账户、持仓与交易记录（本地私有，含本机路径，禁止上传）
+tools/sim_data/
 
 # Local reports and decision records may contain personal trading data
 筛选结果/

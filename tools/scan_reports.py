@@ -308,7 +308,9 @@ def scan_day(date_str: Optional[str] = None, top_n_latest: int = 0):
     if top_n_latest > 0:
         files = files[-top_n_latest:]
 
-    print(f"=== 正在扫描 {len(files)} 份筛选报告 ({files[0].split('/')[-2]}) ===")
+    # 兼容 Windows 反斜杠路径与「报告平铺在 筛选结果/ 根目录」两种布局
+    report_dir_label = os.path.basename(os.path.dirname(files[0])) or os.path.basename(BASE_REPORTS_DIR)
+    print(f"=== 正在扫描 {len(files)} 份筛选报告 ({report_dir_label}) ===")
     
     all_passed_history = {}  # code -> [times]
     last_res = None

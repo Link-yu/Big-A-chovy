@@ -5,6 +5,7 @@
 全部用 mock 打桩，不依赖真实网络。
 """
 
+import json
 import os
 import time
 import unittest
@@ -73,18 +74,38 @@ class NetworkPathTests(unittest.TestCase):
         primary = np.PROBE_ENDPOINTS[0][0]
         with patch.object(np, "_probe_all",
                           return_value={name: (None if name == primary else 10.0)
-                                        for name, _, _ in np.PROBE_ENDPOINTS}):
+                                        for name, *_ in np.PROBE_ENDPOINTS}):
             self.assertIsNone(np._probe_one("直连", None))
 
     def test_probe_one_penalizes_degraded_endpoints(self):
         """辅助端点不通时路径仍可用，但要吃排序惩罚并被标记降级。"""
-        names = [n for n, _, _ in np.PROBE_ENDPOINTS]
-        raw = {names[0]: 100.0, names[1]: None, names[2]: 120.0}
+        names = [n for n, *_ in np.PROBE_ENDPOINTS]
+        raw = {n: 100.0 for n in names}
+        raw[names[1]] = None          # 辅助端点（K线）不通
         with patch.object(np, "_probe_all", return_value=raw):
             got = np._probe_one("直连", None)
         self.assertIsNotNone(got)
         self.assertEqual(got["degraded"], [names[1]])
-        self.assertGreater(got["score"], max(100.0, 120.0))  # 惩罚已计入
+        self.assertAlmostEqual(got["score"], 100.0 + np.DEGRADE_PENALTY_MS, places=1)
+
+    def test_probe_endpoints_structure_and_stability(self):
+        """端点表为四元组 (名称, URL, 参数, 采样次数)；采样次数用于抵御间歇性断连。
+
+        2026-09-21：原第三个端点 82.push2 在所有出口均失效，且引擎资金流字段实际取自
+        push2delay 的 clist 接口，故移除；改为只保留主端点 + K线端点。若未来再加端点，
+        必须是引擎真实依赖、且能区分不同出口的端点，否则只会同质化惩罚、掩盖真实差异。
+        """
+        self.assertGreaterEqual(len(np.PROBE_ENDPOINTS), 2)
+        for item in np.PROBE_ENDPOINTS:
+            self.assertEqual(len(item), 4, f"端点定义应为四元组: {item}")
+            name, url, params, samples = item
+            self.assertIsInstance(name, str)
+            self.assertTrue(url.startswith("https://"))
+            self.assertIsInstance(params, dict)
+            self.assertGreaterEqual(int(samples), 1)
+        self.assertNotIn("82push2", [n for n, *_ in np.PROBE_ENDPOINTS])
+        # K线端点必须多次采样：直连下存在约 1/3 概率的间歇 RemoteDisconnected
+        self.assertGreaterEqual(dict((n, s) for n, _, _, s in np.PROBE_ENDPOINTS)["push2his"], 2)
 
     # ---------- 排序与剔除 ----------
     def test_probe_paths_sorts_by_score(self):
@@ -245,9 +266,19 @@ class NetworkPathTests(unittest.TestCase):
             os.unlink(tmp)
 
     def test_shipped_config_is_valid(self):
+        """自带配置必须可解析：允许空数组（= 明确禁用代理），但格式错误以外的值不得回落默认端口。
+
+        空数组是合法值——2026-09-21 起本机明确禁用全部候选代理端口（见 proxy_ports.json
+        的 _ports_note）：直连实测可用，而死端口/海外出口只会污染排序。
+        """
+        raw = json.loads(np._PORTS_CONFIG_PATH.read_text(encoding="utf-8"))
+        self.assertIn("candidate_ports", raw, "自带配置必须显式声明 candidate_ports")
         ports = np.load_candidate_ports()
-        self.assertTrue(ports, "项目自带的 proxy_ports.json 必须能解析出端口")
         self.assertTrue(all(isinstance(p, int) for p in ports))
+        if raw["candidate_ports"] == []:
+            self.assertEqual(ports, (), "空数组必须解析为空元组（禁用代理），不得回落默认端口")
+        else:
+            self.assertTrue(ports, "非空配置必须能解析出端口")
 
 
 if __name__ == "__main__":

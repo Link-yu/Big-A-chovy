@@ -19,7 +19,7 @@ def track_stock_timeline(code_or_name: str, date_str: Optional[str] = None):
         print(f"未找到相关报告文件: date={date_str}")
         return
 
-    print(f"=== 正在检索标的 [{code_or_name}] 在 {len(files)} 份报告中的轨迹 ({files[0].split('/')[-2]}) ===")
+    print(f"=== 正在检索标的 [{code_or_name}] 在 {len(files)} 份报告中的轨迹 ({os.path.basename(os.path.dirname(files[0]))}) ===")
     
     hits = []
     for f in files:

@@ -196,6 +196,49 @@ RULE_CONFIG: Dict[str, Any] = {
             "divergence",
         ],
     },
+    # ---- 资金约束模拟盘（2026-09-21 新增，待验证） ----
+    # 与既有「模拟仓」的区别：既有模拟仓是**信号样本采集器**（框架第69/104行：
+    # 模拟资金与笔数不限），本段是**资金曲线验证器**（固定本金 10 万，考核净值）。
+    # 两者职责隔离，不得互相升级为真实仓依据。参数变更须同步《选股框架.md》。
+    "sim": {
+        "enabled": True,
+        "initial_capital": 100000.0,
+        "account_file": "tools/sim_data/sim_account.json",
+        "decision_record_sync": True,   # 每个交易日快照写回 positions.simulated / cash.sim_available
+        "position": {
+            "min_lots": 1,                    # 「1手起步」：任何档位算出的手数不足1手时按1手
+            "single_stock_cap_ratio": 0.25,   # 单股上限 1/4 本金（对齐全框架第107行真实仓上限）
+            "max_new_positions_per_day": 5,   # 单日最多新开，确保 AI 需在候选间排序选择
+            "cross_week_halved": True,        # 跨周场景目标仓位减半（框架第114行待验证项）
+            # 档位：target_ratio 为目标金额占初始本金比例；lots_fixed 表示固定手数（不看比例）
+            "tiers": {
+                "S": {"lots_fixed": 1, "label": "起步档·固定1手"},
+                "A": {"target_ratio": 0.025, "label": "标准档·1/40"},
+                "B": {"target_ratio": 0.10, "label": "加强档·1/10"},
+            },
+        },
+        "entry": {
+            "allow_formal": True,        # 正式候选（5/5 + absolute + 共振 + 分笔五档 + 基本面盈利）
+            "allow_experimental": True,  # 框架已许可的模拟实验类别
+            "experimental_categories": [
+                "pullback_relax",  # 回落放宽：<2.0%且主力>10%，或 <3.0%且主力>15%
+                "coalition",       # 合力主升（生产标签 ✓(合力)）
+                "breakout",        # 观察池突破状态机 CONFIRMED/B_BREAKOUT/A_STRICT
+                "sector_boost",    # 主线板块协同加分
+            ],
+            "veto_announcement": ["avoid", "unknown"],  # 一票否决
+            "veto_negative_super_net": True,            # 超大单为负一票否决
+            "no_averaging_down": True,                  # 已持仓标的不再加仓（框架第17行绝不补仓）
+        },
+        "exit": {
+            "stop_loss_pct": -4.0,       # 框架第111行：−3~4%，默认取 -3.5 为常规、-4.0 为极限
+            "stop_loss_default_pct": -3.5,
+            "take_profit_pct": 2.0,      # 框架第112行：+2%
+            "t1_window_start": "09:30",  # 框架第113行：次日 09:30–09:45
+            "t1_exit_deadline": "09:45",
+            "t1_no_sell_on_buy_day": True,
+        },
+    },
 }
 
 

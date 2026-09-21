@@ -204,7 +204,10 @@ PORT = 8765
 # 单次筛选硬超时（秒）。健康刷新通常 5~10s（K线走缓存）；若代理在筛选中途掉线，
 # 引擎会在超时附近空耗，这里兜底中止该轮，标记代理不可用并保留快照，
 # 避免前端一直停在「筛选中」。
-SCREENING_TIMEOUT = 120
+# 2026-09-21 由 120 提到 180：本机（浙江电信）所有东财端点实测 450~820ms，是接口在
+# 该出口下的正常水位（本机到百度 TCP 仅 15ms，故非链路问题），盘中高峰一轮约
+# 90~100s，距 120 只剩 20s 余量，偶发抖动就会误判超时并把看板打回旧快照。
+SCREENING_TIMEOUT = 180
 # 代理断开时，用更短的轮询间隔探测恢复（正常刷新间隔是 settings["interval"]=90s）。
 # 你一旦把代理弄通，看板约 20s 内自动恢复，不用干等一整轮。
 PROXY_RECOVERY_INTERVAL = 15
@@ -277,7 +280,14 @@ class ScreeningScheduler:
         self.settings = {
             "skip_announcements": False,
             "skip_capital_ranking": False,
-            "network_mode": "auto",
+            # 2026-09-21 改为 direct。本机（Windows，浙江电信内网）实测：
+            #   纯直连一轮 49s、market_fetch_complete=true、零降级；
+            #   auto 模式因 K线端点(push2his)间歇失败被同质化惩罚，会把本机代理
+            #   (HTTPS_PROXY=127.0.0.1:1030) 排到直连之前，而该代理出口的 push2his
+            #   100% 不通，每只标的都要先失败一次才回落，整轮拉长到 76s+，
+            #   修复前更因候选里混入日本出口节点(7897)直接跑满 120s 超时。
+            # 直连被限速或不可用时，再在界面上切回 auto（network_path 已同步修复排序）。
+            "network_mode": "direct",
             "auto_refresh": True,
             "auto_shutdown": True,
             "interval": 90,

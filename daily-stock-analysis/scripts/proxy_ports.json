@@ -1,8 +1,11 @@
 {
-  "_comment": "候选代理端口（按优先级）。换代理软件只改这一处：network_path.py 与 keep_proxy_alive.sh 都读本文件。",
-  "candidate_ports": [7890, 7897],
+  "_comment": "候选代理端口（按优先级）。换代理软件只改这一处：network_path.py 与 keep_proxy_alive.sh 都读本文件。空数组 = 禁用全部本机代理端口（见 network_path.load_candidate_ports）。",
+  "candidate_ports": [],
   "_ports_note": {
-    "7890": "Clash Party (mihomo-party) mixed-port，当前主力",
-    "7897": "Clash Verge mixed-port，兼容兜底"
+    "1030": "已移除：属 sandbox-cli（WorkBuddy 沙箱会话的本地代理），并非本机常驻服务，随会话生死。2026-09-21 曾短暂写入候选（出口为杭州电信、对东财无害），但它会让「WorkBuddy 会话内」与「用户自建终端」两套环境选到不同路径，行为不可预测。禁止加回。",
+    "7890": "已停用：无监听端口，保留记录以便回溯。",
+    "7897": "已移除：Clash Verge mixed-port，出口为日本东京 203.190.1.61。2026-09-21 实测——该出口下 push2his 100% 失败、push2 间歇 RemoteDisconnected，而探测惩罚与直连相同导致排序时它反而胜出，引擎全程走日本出口后单轮跑满 120s 超时、看板退化为重放旧快照。切勿加回。",
+    "7899": "已移除：同属 Clash 内核（clash-meta），出口与 7897 同节点。",
+    "_rule": "只允许加入「本机常驻、国内出口」的端口。海外出口对东财行情接口是纯负资产：东财会拦截海外 IP 的 push2/push2his（push2delay 例外，它本就为延迟场景设计）。没有可用代理时保持空数组，直连是可用的默认路径。"
   }
 }

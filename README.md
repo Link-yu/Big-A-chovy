@@ -19,11 +19,22 @@
 
 ### 环境要求
 
-- macOS（双击 `.command` 启动器需要 macOS）。
+- macOS（双击 `.command` 启动器需要 macOS）或 Windows（使用 PowerShell 脚本，见下）。
 - Python 3.10 或更高版本，建议使用 Python 3.13。
 - 能访问行情接口的网络环境。默认 `auto` 模式会实测直连、本机候选代理端口、环境代理和系统代理后择优；如直连受限，请在 `daily-stock-analysis/scripts/proxy_ports.json` 中配置可用的本机 HTTP 代理端口。代理软件不限定为 Clash。
 
-> 当前版本未做 Windows 适配。项目中的 `.command` 启动器、macOS `scutil` 代理检测、`open`/`osascript` 和部分进程管理命令均按 macOS 编写。Windows 用户可以自行尝试直接运行核心 Python 脚本，但 GUI、实时看板启动、代理检测和路径行为不保证正常，也暂不提供 Windows 专用安装或启动方案。
+> **Windows 适配状态**：核心 Python 脚本、命令行筛选和实时看板可在 Windows 运行；macOS 专属的 `.command` 双击启动器、`scutil` 代理检测、`open`/`osascript` 不可用（Windows 上 `python3` 命令通常不存在，请用 `python`）。Windows 请使用 `daily-stock-analysis/` 下的 PowerShell 脚本：
+>
+> ```powershell
+> # 启动看板：后台运行 + 用 Edge 打开页面（-NoBrowser 只启动服务，-Stop 停止）
+> powershell -ExecutionPolicy Bypass -File "daily-stock-analysis\启动实时看板.ps1"
+>
+> # 注册/注销：工作日 09:15 自动启动（看板 15:15 收盘后自行退出并归档）
+> powershell -ExecutionPolicy Bypass -File "daily-stock-analysis\注册看板定时任务.ps1"
+> powershell -ExecutionPolicy Bypass -File "daily-stock-analysis\注册看板定时任务.ps1" -Unregister
+> ```
+>
+> 计划任务只能按星期触发，**不识别法定节假日**，休市日会照常启动看板（看板本身不会产生有效新数据）。桌面 GUI（Tkinter）可尝试直接运行，但窗口位置记忆等行为未在 Windows 验证。
 
 脚本依赖尽量使用 Python 标准库，并对可选依赖提供了降级处理：
 
@@ -117,13 +128,19 @@ python3 daily-stock-analysis/scripts/a_share_daily_screen.py \
 
 ### 3. 启动实时看板
 
-双击：
+macOS 双击：
 
 ```text
 daily-stock-analysis/运行实时看板.command
 ```
 
-或在终端运行：
+Windows 运行（后台启动、用 Edge 打开页面、日志写入 `daily-stock-analysis/logs/`）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "daily-stock-analysis\启动实时看板.ps1"
+```
+
+或在终端直接运行（不做后台托管，也不指定浏览器）：
 
 ```bash
 python3 daily-stock-analysis/scripts/realtime_dashboard.py
@@ -137,7 +154,15 @@ python3 daily-stock-analysis/scripts/realtime_dashboard.py
 daily-stock-analysis/停止实时看板.command
 ```
 
+Windows 停止：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "daily-stock-analysis\启动实时看板.ps1" -Stop
+```
+
 也可以在终端按 `Ctrl+C` 停止。
+
+> 看板在工作日 15:15–15:59 之间会自动关机，并把当日报告归档到 `筛选结果/YYYYMMDD/`，所以**下一个交易日需要重新启动**（上面「环境要求」里的定时任务可自动完成）。工作日 15:15 之后手动启动会让看板立即退出，这是预期行为，不是故障。
 
 看板提供以下本机接口：
 

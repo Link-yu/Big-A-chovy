@@ -11,7 +11,11 @@
 # 新行为（软件无关）：
 #   1. 按 CANDIDATE_PORTS 顺序探测，选出第一个"活着且能代理行情"的端口
 #   2. 系统代理指向它；若已经是它则不做任何改动
-#   3. 所有候选都挂 → 关闭系统代理，回退直连（2026-09-08 实测行情接口直连全通）
+#   3. 没有可用候选（全部挂了，或候选列表为空）→ 关闭系统代理，回退直连
+#      （2026-09-08 实测行情接口直连全通；2026-09-21 起 candidate_ports 即为空）
+#
+# 候选列表只放「本机常驻 + 国内出口」的端口：海外出口（如 Clash 日本节点）会让东财
+# push2/push2his 大面积失败；WorkBuddy 沙箱的 sandbox-cli 端口也非本机常驻服务。
 #   4. 绝不自动启动任何代理 App —— 换软件只需改下面的端口顺序
 #
 # 由 ~/Library/LaunchAgents/com.luqiang.keepclashproxy.plist 每 30 秒调用一次。
@@ -19,10 +23,12 @@
 # ---- 配置 ----
 # 候选代理端口，按优先级排列。换代理软件时改 proxy_ports.json 即可
 # （与 scripts/network_path.py 共用同一份配置，避免两处不同步）。
-#   7890 = Clash Party（当前主力，mihomo-party 的 mixed-port）
-#   7897 = Clash Verge（兼容保留，退出后自动跳过）
+#   空数组 [] = 明确禁用全部代理端口，脚本会关闭系统代理回退直连。
+#   2026-09-21：原实现在候选为空时回落到硬编码 "7890 7897"，把「禁用代理」
+#   静默翻译成「启用代理」——与 network_path.load_candidate_ports 的旧 bug 同类。
+#   当前配置即为 []（本机直连实测可用，代理是纯负资产），故该回落已移除。
+ports=""
 PORTS_CONFIG="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/proxy_ports.json"
-DEFAULT_PORTS="7890 7897"
 if [ -f "$PORTS_CONFIG" ]; then
     # 从 json 里抠出 candidate_ports 数组内容（不引入 jq/python 依赖）
     cfg=$(sed -n 's/.*"candidate_ports"[[:space:]]*:[[:space:]]*\[\([^]]*\)\].*/\1/p' "$PORTS_CONFIG" \
@@ -36,10 +42,8 @@ if [ -f "$PORTS_CONFIG" ]; then
         esac
     done
 fi
-if [ -z "${ports// }" ]; then
-    ports="$DEFAULT_PORTS"
-fi
-read -r -a CANDIDATE_PORTS <<< "$ports"
+# ports 为空即代表「无候选代理」：不回落任何默认端口，走直连。
+read -r -a CANDIDATE_PORTS <<< "${ports// }"
 PROXY_HOST="127.0.0.1"
 # 健康检查：能通过这个 URL 拿到 HTTP 200 才算代理可用（东财实时行情，全天可访问）
 HEALTH_URL="https://push2delay.eastmoney.com/api/qt/clist/get?pn=1&pz=1&fs=m:1+t:2"

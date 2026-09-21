@@ -51,14 +51,23 @@ except Exception:  # 引擎在无 requests 环境走 urllib 兜底，本模块�
 # ---- 配置 ----
 # 健康检查端点。第一个为主端点：必须通，该路径才算可用；
 # 其余为辅助端点：不通只记降级 + 排序惩罚（不同域名可能表现不同）。
-PROBE_ENDPOINTS: Tuple[Tuple[str, str, Dict[str, Any]], ...] = (
+#
+# 字段含义：(名称, URL, 参数, 采样次数)。采样次数 >1 表示该端点存在间歇性失败，
+# 需要多次尝试、取「最快成功值」，否则会把可用路径误判为降级。
+#
+# 2026-09-21 重构（关键）：
+#   原先第三个端点是 82.push2（当时被当作"资金流专用域名"）。实测该域名在**所有**出口
+#   都返回 RemoteDisconnected（直连 / 国内代理 / 海外代理一致），已彻底失效；而引擎的资金流
+#   字段（f62/f184）本来就取自 push2delay 的 clist 接口，并不依赖它。一个全员失败的端点
+#   等于给每条路径加同一个惩罚，反而把真正有区分度的 push2his 信息稀释掉——
+#   这正是境外出口节点被误选为"最快路径"的直接原因。
+#   现改为只保留两个真实业务端点，且 push2his 采样 3 次（直连约 1/3 概率间歇断连）。
+PROBE_ENDPOINTS: Tuple[Tuple[str, str, Dict[str, Any], int], ...] = (
     ("push2delay", "https://push2delay.eastmoney.com/api/qt/clist/get",
-     {"pn": 1, "pz": 1, "fs": "m:1+t:2", "fields": "f12,f14"}),
-    ("82push2", "https://82.push2.eastmoney.com/api/qt/clist/get",
-     {"pn": 1, "pz": 1, "fs": "m:0+t:6", "fields": "f12,f14"}),
+     {"pn": 1, "pz": 1, "fs": "m:1+t:2", "fields": "f12,f14"}, 1),
     ("push2his", "https://push2his.eastmoney.com/api/qt/stock/kline/get",
      {"secid": "1.600000", "klt": "101", "fqt": "1", "lmt": "1",
-      "fields1": "f1", "fields2": "f51"}),
+      "fields1": "f1", "fields2": "f51"}, 3),
 )
 PROBE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) daily-stock-analysis/1.0",
@@ -70,7 +79,11 @@ CACHE_TTL = 300.0          # 成功结果的缓存时长（秒）
 NEGATIVE_TTL = 30.0        # 全部失败的负缓存时长（秒），避免网络断开时每次请求都探测
 SLOW_PATH_MS = 2000.0      # 超过此延迟视为「太慢」，有替代路径时不用它
 STICKY_MARGIN_MS = 50.0    # 当前路径比最快路径慢不超过这个值就不切换（防抖动）
-DEGRADE_PENALTY_MS = 1000.0  # 每个不通的辅助端点的排序惩罚
+# 每个不通的辅助端点的排序惩罚。原值 1000 偏低：一个端点不通意味着批量阶段每只标的
+# 都要先在这条路径上失败一次才切换，实际损失远超 1s，导致「延迟低但端点残缺」的路径
+# 反而胜出（2026-09-21 实测境外代理 35ms 排到直连 789ms 之前）。提高到 3000 确保
+# 「端点全通」优先于「单纯延迟低」；所有路径都残缺时惩罚相同，仍按延迟排序。
+DEGRADE_PENALTY_MS = 3000.0
 FAIL_STREAK_LIMIT = 3      # 连续失败几次后进入冷却
 COOLDOWN_SEC = 60.0        # 冷却时长（秒），期间不再探测该路径
 
@@ -80,18 +93,21 @@ _PORTS_CONFIG_PATH = Path(__file__).resolve().parent / "proxy_ports.json"
 
 
 def load_candidate_ports() -> Tuple[int, ...]:
-    """从 proxy_ports.json 读候选端口；文件缺失或格式错误时退回默认值。
+    """从 proxy_ports.json 读候选端口；文件缺失、键缺失或格式错误时退回默认值。
 
     注意：keep_proxy_alive.sh 读的是同一个文件，换代理软件改一处即可。
+
+    2026-09-21 修正：显式写 "candidate_ports": [] 表示「禁用所有本机代理端口」，
+    此时返回空元组。原实现把空数组也当成"读不到配置"而回落到 DEFAULT_LOCAL_PROXY_PORTS，
+    于是"禁用代理"的意图被静默翻译成"启用 7890/7897"——正是这两个端口把日本出口节点
+    送进候选、在排序中压过直连、导致引擎整轮超时。
     """
     try:
         if _PORTS_CONFIG_PATH.exists():
             data = json.loads(_PORTS_CONFIG_PATH.read_text(encoding="utf-8"))
             ports = data.get("candidate_ports")
             if isinstance(ports, list):
-                parsed = tuple(int(p) for p in ports if str(p).strip().isdigit())
-                if parsed:
-                    return parsed
+                return tuple(int(p) for p in ports if str(p).strip().isdigit())
     except Exception:
         pass
     return DEFAULT_LOCAL_PROXY_PORTS
@@ -176,22 +192,32 @@ def _is_em_json(data: Any) -> bool:
 
 
 def _probe_requests(proxy_url: Optional[str]) -> Dict[str, Optional[float]]:
-    """用 requests 依次探测各端点，返回 {端点名: 延迟ms 或 None}。"""
+    """用 requests 依次探测各端点，返回 {端点名: 延迟ms 或 None}。
+
+    采样次数 >1 的端点：只要有一次成功即算通，取最快成功值并提前收敛。
+    避免「单次间歇失败 → 可用路径被判降级 → 排序输给本来更差的路径」。
+    """
     result: Dict[str, Optional[float]] = {}
     session = _session_for(proxy_url)
     if session is None:
-        return {name: None for name, _, _ in PROBE_ENDPOINTS}
-    for name, url, params in PROBE_ENDPOINTS:
-        try:
-            t0 = time.perf_counter()
-            resp = session.get(url, params=params, headers=PROBE_HEADERS,
-                               timeout=PROBE_TIMEOUT, verify=False)
-            resp.raise_for_status()
-            data = resp.json()
-            latency = (time.perf_counter() - t0) * 1000.0
-            result[name] = round(latency, 1) if _is_em_json(data) else None
-        except Exception:
-            result[name] = None
+        return {name: None for name, *_ in PROBE_ENDPOINTS}
+    for name, url, params, samples in PROBE_ENDPOINTS:
+        best: Optional[float] = None
+        for _ in range(max(1, samples)):
+            try:
+                t0 = time.perf_counter()
+                resp = session.get(url, params=params, headers=PROBE_HEADERS,
+                                   timeout=PROBE_TIMEOUT, verify=False)
+                resp.raise_for_status()
+                data = resp.json()
+                latency = (time.perf_counter() - t0) * 1000.0
+                if _is_em_json(data):
+                    cand = round(latency, 1)
+                    best = cand if best is None else min(best, cand)
+                    break  # 已确认可达，无需继续采样
+            except Exception:
+                continue
+        result[name] = best
     return result
 
 
@@ -199,26 +225,31 @@ def _probe_urllib(proxy_url: Optional[str]) -> Dict[str, Optional[float]]:
     """无 requests 环境用标准库探测（与引擎 urllib 兜底同一传输方式）。"""
     result: Dict[str, Optional[float]] = {}
     ssl_ctx = ssl._create_unverified_context()
-    for name, url, params in PROBE_ENDPOINTS:
-        try:
-            handlers = [urllib.request.HTTPSHandler(context=ssl_ctx)]
-            if proxy_url:
-                handlers.append(urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
-            else:
-                handlers.append(urllib.request.ProxyHandler({}))
-            opener = urllib.request.build_opener(*handlers)
-            req = urllib.request.Request(f"{url}?{urllib.parse.urlencode(params)}",
-                                         headers=PROBE_HEADERS)
-            t0 = time.perf_counter()
-            with opener.open(req, timeout=PROBE_TIMEOUT) as resp:
-                if resp.status != 200:
-                    result[name] = None
-                    continue
-                data = json.loads(resp.read().decode("utf-8", "replace"))
-            latency = (time.perf_counter() - t0) * 1000.0
-            result[name] = round(latency, 1) if _is_em_json(data) else None
-        except Exception:
-            result[name] = None
+    for name, url, params, samples in PROBE_ENDPOINTS:
+        best: Optional[float] = None
+        for _ in range(max(1, samples)):
+            try:
+                handlers = [urllib.request.HTTPSHandler(context=ssl_ctx)]
+                if proxy_url:
+                    handlers.append(urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
+                else:
+                    handlers.append(urllib.request.ProxyHandler({}))
+                opener = urllib.request.build_opener(*handlers)
+                req = urllib.request.Request(f"{url}?{urllib.parse.urlencode(params)}",
+                                             headers=PROBE_HEADERS)
+                t0 = time.perf_counter()
+                with opener.open(req, timeout=PROBE_TIMEOUT) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = json.loads(resp.read().decode("utf-8", "replace"))
+                latency = (time.perf_counter() - t0) * 1000.0
+                if _is_em_json(data):
+                    cand = round(latency, 1)
+                    best = cand if best is None else min(best, cand)
+                    break
+            except Exception:
+                continue
+        result[name] = best
     return result
 
 
@@ -236,7 +267,7 @@ def _probe_one(label: str, proxy_url: Optional[str]) -> Optional[Dict[str, Any]]
     primary = raw.get(primary_name)
     if primary is None:
         return None  # 主端点不通 → 这条路径不可用
-    degraded = [name for name, _, _ in PROBE_ENDPOINTS[1:] if raw.get(name) is None]
+    degraded = [name for name, *_ in PROBE_ENDPOINTS[1:] if raw.get(name) is None]
     # 综合延迟：各端点实测值的最大值（保守），再加降级惩罚
     observed = [v for v in raw.values() if v is not None]
     score = max(observed) + DEGRADE_PENALTY_MS * len(degraded)
@@ -392,7 +423,7 @@ def diagnostics() -> Dict[str, Any]:
             "ports_config": str(_PORTS_CONFIG_PATH),
             "ports_config_exists": _PORTS_CONFIG_PATH.exists(),
             "candidate_ports": list(LOCAL_PROXY_PORTS),
-            "probe_endpoints": [name for name, _, _ in PROBE_ENDPOINTS],
+            "probe_endpoints": [name for name, *_ in PROBE_ENDPOINTS],
             "current_label": _current_label,
             "last_switch_reason": _last_switch_reason,
             "fail_streak": dict(_fail_streak),
@@ -404,7 +435,7 @@ def diagnostics() -> Dict[str, Any]:
 
 def _main() -> int:
     paths = probe_paths()
-    print(f"探测端点: {', '.join(name for name, _, _ in PROBE_ENDPOINTS)}（第一个为主端点，必须通）")
+    print(f"探测端点: {', '.join(name for name, *_ in PROBE_ENDPOINTS)}（第一个为主端点，必须通）")
     print(f"候选端口: {list(LOCAL_PROXY_PORTS)}  (来源: {_PORTS_CONFIG_PATH.name}"
           f"{'' if _PORTS_CONFIG_PATH.exists() else '，文件不存在用默认值'})")
     if not paths:
