@@ -42,6 +42,7 @@ A 股 T+1 超短线（低吸模式）量化筛选 + AI 辅助决策工作台。�
 - 预测 ≠ 规则：只输出规则结果，不给「我觉得会涨」。
 - `coalition`、观察池突破、`sector_boost` 满20个完整结算样本并评估转正前仅模拟；`divergence_leader` 仅影子采样；回落放宽仅模拟。权限详见框架。
 - **资金约束模拟盘（`tools/sim_data/`）不参与真实仓放行**：它是「按框架规则机械执行的收益曲线验证器」，与生产裁决无关；其档位阈值属待验证项，未满 20 个完整结算样本前不得据此调整真实仓。规则判定一律走 `tools/sim_account.py`，**不得由语言模型自行决定买卖或仓位**，也不得用 `--force` 绕过窗口与门槛。
+- **实盘钉钉提醒（`tools/live_alert.py`）只是「该看盘了」的通知，不构成买入建议**：消息里的候选仅代表**报告层面正式门槛全过**，基本面盈利与分笔五档尚未核验，**不等于可买**；收到提醒后仍须按框架发 `ggp` 完成七项支撑核验。钉钉 webhook 存于 `tools/alert_config.json`（**已 gitignore，禁止上传**），该机器人关键词为 `每日复盘`，消息尾部自动带通道标识。
 - 输出必须双仓分层：①真实仓可开仓 ②模拟仓可买 ③仅观察/真实仓暂不开 ④完全空仓；存在模拟候选时不得笼统写「空仓」。
 - 真实仓开仓建议必须附完整支撑原因（主线 / 资金 / 分笔五档 / 买点 / 基本面 / 模拟验证 / 盈亏比）+ 买点区间 + 止损 + T+1 计划。
 - 建仓前必验：分笔与五档承接、基本面盈亏（`python3 tools/query_financials.py <代码>`）。
@@ -58,6 +59,9 @@ python3 tools/sim_account.py status                  # 资金约束模拟盘：�
 python3 tools/sim_account.py scan                    # 模拟盘可开仓清单（只读，不写账本）
 python3 tools/sim_account.py nav                     # 模拟盘净值曲线
 python3 tools/sim_account.py auto [--dry-run]        # 按当前时段自动裁决（定时任务调用）
+python3 tools/live_alert.py auto                     # 实盘定时提醒：按时点判定并推钉钉（定时任务调用）
+python3 tools/live_alert.py check --at 10:40         # 只打印不发，验证消息组装
+python3 tools/live_alert.py test                     # 钉钉连通测试
 python3 tools/validate_consistency.py                # 框架-代码-影子库一致性对账（只读）
 curl -s "https://qt.gtimg.cn/q=sh601615" | iconv -f GBK -t UTF-8   # 实时行情
 ```
@@ -70,7 +74,7 @@ curl -s "https://qt.gtimg.cn/q=sh601615" | iconv -f GBK -t UTF-8   # 实时行�
 
 ## 当前数据备注（易踩坑）
 
-- 报告**默认平铺在 `筛选结果/` 根目录**，不建 `YYYYMMDD/` 子目录（2026-08-25、2026-09-21 两次实测均是）。不带日期参数的默认扫描（如 `scan_reports.py --latest`）会命中根目录下的旧日期而非最新交易日——盘中取报告务必先确定目标日期。
+- **报告目录布局会变**：**盘中平铺在 `筛选结果/` 根目录，收盘后归档进 `筛选结果/YYYYMMDD/`**（2026-09-21 实测：14:16 时 10 份在根目录，16:17 时 77 份已全部移入 `筛选结果/20260921/`）。`latest_report()` 先扫根目录、为空再扫子目录，两种布局都能取到。但**盘中取报告务必先确定目标日期**：不带日期参数的默认扫描会命中旧日期而非当日。
 - 网络路径为**代码内实测择优**（2026-09-09 方案 C，2026-09-21 修正）：`daily-stock-analysis/scripts/network_path.py` 并发实测「直连 + 本机候选代理端口（来自 `proxy_ports.json` 的 `candidate_ports`，**现为空数组 = 禁用全部本机代理端口，只走直连**）+ 环境代理 + 系统代理」对东财接口的真实延迟，最快路径优先，**不依赖系统代理设置**。诊断：`python daily-stock-analysis/scripts/network_path.py`。
   - **配置唯一来源**：`proxy_ports.json` 的 `candidate_ports`，`network_path.py` 与 `keep_proxy_alive.sh` 共用——**换代理软件只改这一处**。空数组是合法值，表示「明确禁用代理」，不会回落到默认端口（2026-09-21 修的 bug：原实现把 `[]` 当成读不到配置）。
   - **不要把「非本机常驻」的端口写进候选**。2026-09-21 二次修正：曾把 1030 写入候选（出口杭州电信、对东财无害），但实测其属 `sandbox-cli`——WorkBuddy 沙箱会话的本地代理，**随会话生死**。留着会让「WorkBuddy 会话内」与「用户自建终端」选到不同路径，行为不可预测。

@@ -41,6 +41,9 @@ tools/shadow_data/shadow_samples.json
 # 模拟盘账户、持仓与交易记录（本地私有，含本机路径，禁止上传）
 tools/sim_data/
 
+# 实盘提醒的钉钉 webhook 配置（含 access_token，本地私有，禁止上传）
+tools/alert_config.json
+
 # Local reports and decision records may contain personal trading data
 筛选结果/
 决策记录/
