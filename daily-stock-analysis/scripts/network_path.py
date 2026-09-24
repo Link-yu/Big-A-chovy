@@ -62,9 +62,25 @@ except Exception:  # 引擎在无 requests 环境走 urllib 兜底，本模块�
 #   等于给每条路径加同一个惩罚，反而把真正有区分度的 push2his 信息稀释掉——
 #   这正是境外出口节点被误选为"最快路径"的直接原因。
 #   现改为只保留两个真实业务端点，且 push2his 采样 3 次（直连约 1/3 概率间歇断连）。
+#
+# 2026-09-23 修复（关键，实测驱动）：
+#   现象：看板全天刷 "no working network path; preserving last snapshot"（快照停在 13:13:21），
+#         而同一时段引擎自己却成功拿到全量 56 页 5561 行 —— 因为引擎的东财端点表有 5 个 host
+#         依次回退（见 a_share_daily_screen.py 的 EM_*_URLS），push2delay 挂了它照样取到数。
+#   根因：探测此前只有 push2delay 一个主端点、且采样次数为 1。实测该端点直连成功率仅约 1/3
+#         （`_probe_all(None)` 直连 6 连测：4 次 None / 2 次可用），单次采样 ⇒ 约 2/3 概率把
+#         整条路径判死 ⇒ has_working_path() 返回 False ⇒ 看板在启动引擎**之前**就跳过本轮。
+#         即「探测口径」与「取数口径」不一致（两张皮）。
+#   修复：① 主端点扩为「push2 系任一端点可达即算通」，与引擎的多 host 回退口径对齐；
+#         ② 主端点采样 3 次（2026-09-23 二次实测：看板进程视角下 5 轮 warm_up 仅 2 轮判可用，
+#            单次探测命中率约 40%~50%；失败是「快速失败」约 0.3~0.8s 即返回，加采样成本很低）；
+#         ③ K线端点保持 3 次。
+PRIMARY_ENDPOINT_NAMES: Tuple[str, ...] = ("push2delay", "push2")
 PROBE_ENDPOINTS: Tuple[Tuple[str, str, Dict[str, Any], int], ...] = (
     ("push2delay", "https://push2delay.eastmoney.com/api/qt/clist/get",
-     {"pn": 1, "pz": 1, "fs": "m:1+t:2", "fields": "f12,f14"}, 1),
+     {"pn": 1, "pz": 1, "fs": "m:1+t:2", "fields": "f12,f14"}, 3),
+    ("push2", "https://push2.eastmoney.com/api/qt/clist/get",
+     {"pn": 1, "pz": 1, "fs": "m:1+t:2", "fields": "f12,f14"}, 3),
     ("push2his", "https://push2his.eastmoney.com/api/qt/stock/kline/get",
      {"secid": "1.600000", "klt": "101", "fqt": "1", "lmt": "1",
       "fields1": "f1", "fields2": "f51"}, 3),
@@ -74,7 +90,9 @@ PROBE_HEADERS = {
     "Referer": "https://quote.eastmoney.com/center/gridlist.html",
     "Accept": "application/json,text/plain,*/*",
 }
-PROBE_TIMEOUT = 3.0        # 单端点探测超时（秒）
+PROBE_TIMEOUT = 2.5        # 单端点单次探测超时（秒）。本机实测成功响应 430~900ms；
+                           # 失败多为「快速失败」（约 0.3~0.8s 即 RemoteDisconnected），
+                           # 故调低超时 + 加采样次数，用「多试几次」换稳定性，成本更低。
 CACHE_TTL = 300.0          # 成功结果的缓存时长（秒）
 NEGATIVE_TTL = 30.0        # 全部失败的负缓存时长（秒），避免网络断开时每次请求都探测
 SLOW_PATH_MS = 2000.0      # 超过此延迟视为「太慢」，有替代路径时不用它
@@ -260,23 +278,37 @@ def _probe_all(proxy_url: Optional[str]) -> Dict[str, Optional[float]]:
     return _probe_urllib(proxy_url)
 
 
+def _primary_reachable(raw: Dict[str, Optional[float]]) -> bool:
+    """主端点组内任一端点可达，即认为这条路径能拿到行情。
+
+    必须用「组」而不是单点判定：引擎在 push2delay 失败时会自动回退
+    push2 / 82.push2 / 72.push2 / 83.push2（见 a_share_daily_screen.py 的 EM_*_URLS），
+    因此只认单一 push2delay 会把「引擎明明取得到数」的路径判死——
+    这正是 2026-09-23 看板全天误报「数据源降级」的根因。
+    """
+    return any(raw.get(name) is not None for name in PRIMARY_ENDPOINT_NAMES)
+
+
 def _probe_one(label: str, proxy_url: Optional[str]) -> Optional[Dict[str, Any]]:
-    """实测单条路径；主端点不通返回 None，否则返回带降级信息的路径描述。"""
+    """实测单条路径；主端点组全不通返回 None，否则返回带降级信息的路径描述。"""
     raw = _probe_all(proxy_url)
-    primary_name = PROBE_ENDPOINTS[0][0]
-    primary = raw.get(primary_name)
-    if primary is None:
-        return None  # 主端点不通 → 这条路径不可用
-    degraded = [name for name, *_ in PROBE_ENDPOINTS[1:] if raw.get(name) is None]
+    if not _primary_reachable(raw):
+        return None  # 主端点组全不通 → 这条路径不可用
+    degraded = [name for name, *_ in PROBE_ENDPOINTS
+                if name not in PRIMARY_ENDPOINT_NAMES and raw.get(name) is None]
     # 综合延迟：各端点实测值的最大值（保守），再加降级惩罚
     observed = [v for v in raw.values() if v is not None]
     score = max(observed) + DEGRADE_PENALTY_MS * len(degraded)
+    # 展示用延迟取主端点组里最快的一次实测（组内可能有端点不通，需过滤 None）
+    primary_latency = min(
+        v for v in (raw.get(n) for n in PRIMARY_ENDPOINT_NAMES) if v is not None
+    )
     return {
         "label": label,
         "proxy": proxy_url,
-        "latency_ms": round(primary, 1),      # 主端点实测延迟（展示用）
-        "score": round(score, 1),             # 排序用（含降级惩罚）
-        "degraded": degraded,                 # 不通的辅助端点
+        "latency_ms": round(primary_latency, 1),   # 主端点实测延迟（展示用）
+        "score": round(score, 1),                  # 排序用（含降级惩罚）
+        "degraded": degraded,                      # 不通的辅助端点
         "endpoints": raw,
     }
 
@@ -310,9 +342,13 @@ def probe_paths() -> List[Dict[str, Any]]:
 
     with ThreadPoolExecutor(max_workers=max(2, len(active))) as pool:
         futs = [pool.submit(_probe_one, label, proxy) for label, proxy in active]
+        # 池超时按「端点最坏耗时之和」估算：端点间串行，单端点最坏 = 采样次数 × PROBE_TIMEOUT。
+        # 原公式 (PROBE_TIMEOUT+1.0) * 端点个数 漏算了采样次数——加端点/加采样后，
+        # 全超时的最坏情况会超过池超时，把正在探测的可用路径直接吞成 None（2026-09-23 修正）。
+        budget = PROBE_TIMEOUT * sum(s for *_, s in PROBE_ENDPOINTS) + 2.0
         for i, fut in enumerate(futs):
             try:
-                results[i] = fut.result(timeout=(PROBE_TIMEOUT + 1.0) * len(PROBE_ENDPOINTS))
+                results[i] = fut.result(timeout=budget)
             except Exception:
                 results[i] = None
     paths = [r for r in results if r is not None]
@@ -424,6 +460,7 @@ def diagnostics() -> Dict[str, Any]:
             "ports_config_exists": _PORTS_CONFIG_PATH.exists(),
             "candidate_ports": list(LOCAL_PROXY_PORTS),
             "probe_endpoints": [name for name, *_ in PROBE_ENDPOINTS],
+            "primary_endpoints": list(PRIMARY_ENDPOINT_NAMES),
             "current_label": _current_label,
             "last_switch_reason": _last_switch_reason,
             "fail_streak": dict(_fail_streak),
@@ -435,7 +472,8 @@ def diagnostics() -> Dict[str, Any]:
 
 def _main() -> int:
     paths = probe_paths()
-    print(f"探测端点: {', '.join(name for name, *_ in PROBE_ENDPOINTS)}（第一个为主端点，必须通）")
+    print(f"探测端点: {', '.join(name for name, *_ in PROBE_ENDPOINTS)}"
+          f"（主端点组 {'/'.join(PRIMARY_ENDPOINT_NAMES)} 任一端可达即算通）")
     print(f"候选端口: {list(LOCAL_PROXY_PORTS)}  (来源: {_PORTS_CONFIG_PATH.name}"
           f"{'' if _PORTS_CONFIG_PATH.exists() else '，文件不存在用默认值'})")
     if not paths:

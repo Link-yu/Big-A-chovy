@@ -207,7 +207,14 @@ PORT = 8765
 # 2026-09-21 由 120 提到 180：本机（浙江电信）所有东财端点实测 450~820ms，是接口在
 # 该出口下的正常水位（本机到百度 TCP 仅 15ms，故非链路问题），盘中高峰一轮约
 # 90~100s，距 120 只剩 20s 余量，偶发抖动就会误判超时并把看板打回旧快照。
-SCREENING_TIMEOUT = 180
+# 2026-09-23 由 180 提到 210：当日实测健康轮次 92s / 129s / 133s / 163.2s，
+# 163.2s 距 180 仅剩 17s（约 10%）余量，已验证过一次「163.2s 成功出数」——
+# 若卡在 180 边界会被误判成超时并打回旧快照。网络劣化时东财响应变慢是主因，
+# 与链路无关（同一时刻网页端正常）。
+SCREENING_TIMEOUT = 210
+# 注意：不要用「探测结果」去砍超时。2026-09-23 实测本机健康轮次已需 92~163s，
+# 任何低于该水位的缩短超时都会把正常轮次误判成超时、打回旧快照（曾试图用 90s 降级档，
+# 实测第一轮就跑了 163.2s 并成功出数，说明 90s 必误杀）。探测结果只用于决定轮询间隔。
 # 代理断开时，用更短的轮询间隔探测恢复（正常刷新间隔是 settings["interval"]=90s）。
 # 你一旦把代理弄通，看板约 20s 内自动恢复，不用干等一整轮。
 PROXY_RECOVERY_INTERVAL = 15
@@ -309,22 +316,16 @@ class ScreeningScheduler:
             return False
         try:
             self.is_running = True
-            # 快速失败条件：直连和所有候选代理都拿不到东财数据（network_path 实测）。
-            # 直连可用时不再依赖代理；避免全网断开时空耗一轮超时。
-            if not network_path.has_working_path():
-                self.proxy_unavailable = True
-                prev = self.latest_result
-                prev_meta = (prev or {}).get("meta", {})
-                if prev and "error" not in prev and not prev_meta.get("market_data_degraded"):
-                    self.preserve_snapshot = True
-                    self.preserved_from = prev_meta.get("timestamp")
-                    self.last_run_time = datetime.now()
-                    self.last_run_duration = 0.0
-                    print("[dashboard] no working network path; preserving last snapshot", file=sys.stderr)
-                    return True
-                print("[dashboard] no working network path and no valid snapshot to preserve", file=sys.stderr)
-                return False
-            self.proxy_unavailable = False
+            # 可用路径探测：只用于决定轮询间隔（不通 → 15s 快轮询），不再是跳过整轮的硬门禁。
+            # 原因（2026-09-23 实测）：东财端点在本机是**间歇可用**的——看板进程视角下 5 轮
+            # warm_up 仅 2 轮判可用（单次探测命中率约 40%~50%），而引擎自带多 host 回退
+            # （push2delay→push2→82/72/83.push2）与逐页重试，口径比探测权威得多。
+            # 原实现「探测判死即 return」会让看板在引擎明明取得到数时整天停在旧快照上
+            # （13:14–13:50 全程误报降级，而同时段引擎曾成功取到全量 56 页）。
+            # 现改为：探测不通也实跑一轮，超时统一用 SCREENING_TIMEOUT（不做「降级短超时」——
+            # 实测健康轮次要 92~163s，任何低于该水位的缩短都会误杀正常轮次）；
+            # force（界面「强制刷新」）视为探测通过，由用户显式要求实跑。
+            self.proxy_unavailable = not (force or network_path.has_working_path())
             _inject_proxy_to_session()
             from realtime_engine import run_screening as _engine_run
 
@@ -347,6 +348,8 @@ class ScreeningScheduler:
                 except Exception as e:  # noqa: BLE001
                     ctx["error"] = e
 
+            # 探测判「无路径」时**仍然实跑一轮**（引擎有多 host 回退，口径比探测权威）；
+            # 探测结果只用来决定轮询间隔（proxy_unavailable → 15s 快轮询），不砍超时。
             _th = threading.Thread(target=_worker, daemon=True)
             _th.start()
             _th.join(timeout=SCREENING_TIMEOUT)
@@ -401,6 +404,8 @@ class ScreeningScheduler:
 
                 # 正常更新
                 self.latest_result = result
+                # 引擎实跑成功即证明网络可用 → 覆盖探测的悲观结论，轮询间隔恢复正常档
+                self.proxy_unavailable = False
                 self.last_run_time = datetime.now()
                 self.last_run_duration = elapsed
                 self.preserve_snapshot = bool((not now_trading) and is_incomplete)

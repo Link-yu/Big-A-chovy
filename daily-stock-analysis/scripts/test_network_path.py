@@ -71,22 +71,38 @@ class NetworkPathTests(unittest.TestCase):
         self.assertFalse(np._is_em_json(None))
 
     def test_probe_one_requires_primary_endpoint(self):
-        primary = np.PROBE_ENDPOINTS[0][0]
+        """主端点组（push2 系）**全部**不通 → 整条路径废弃。"""
         with patch.object(np, "_probe_all",
-                          return_value={name: (None if name == primary else 10.0)
+                          return_value={name: (None if name in np.PRIMARY_ENDPOINT_NAMES else 10.0)
                                         for name, *_ in np.PROBE_ENDPOINTS}):
             self.assertIsNone(np._probe_one("直连", None))
 
+    def test_probe_one_accepts_any_primary_member(self):
+        """主端点组内只要一端可达，路径即可用（与引擎多 host 回退口径对齐）。
+
+        2026-09-23 回归：push2delay 直连成功率仅约 1/3，若只认它单点，
+        约 2/3 的探测会误杀路径，导致看板全天误报「数据源降级」。
+        """
+        name = np.PRIMARY_ENDPOINT_NAMES[0]
+        raw = {n: 100.0 for n, *_ in np.PROBE_ENDPOINTS}
+        raw[name] = None                     # 首个主端点不通，组内其余仍通
+        with patch.object(np, "_probe_all", return_value=raw):
+            got = np._probe_one("直连", None)
+        self.assertIsNotNone(got, "组内其它主端点可达时不得判死")
+        self.assertNotIn(name, got["degraded"], "主端点组成员不通不计入降级惩罚")
+
     def test_probe_one_penalizes_degraded_endpoints(self):
         """辅助端点不通时路径仍可用，但要吃排序惩罚并被标记降级。"""
-        names = [n for n, *_ in np.PROBE_ENDPOINTS]
-        raw = {n: 100.0 for n in names}
-        raw[names[1]] = None          # 辅助端点（K线）不通
+        aux = [n for n, *_ in np.PROBE_ENDPOINTS if n not in np.PRIMARY_ENDPOINT_NAMES]
+        self.assertTrue(aux, "应至少有一个辅助端点（K线）")
+        raw = {n: 100.0 for n, *_ in np.PROBE_ENDPOINTS}
+        for n in aux:
+            raw[n] = None                 # 辅助端点（K线）不通
         with patch.object(np, "_probe_all", return_value=raw):
             got = np._probe_one("直连", None)
         self.assertIsNotNone(got)
-        self.assertEqual(got["degraded"], [names[1]])
-        self.assertAlmostEqual(got["score"], 100.0 + np.DEGRADE_PENALTY_MS, places=1)
+        self.assertEqual(got["degraded"], aux)
+        self.assertAlmostEqual(got["score"], 100.0 + np.DEGRADE_PENALTY_MS * len(aux), places=1)
 
     def test_probe_endpoints_structure_and_stability(self):
         """端点表为四元组 (名称, URL, 参数, 采样次数)；采样次数用于抵御间歇性断连。
@@ -94,6 +110,9 @@ class NetworkPathTests(unittest.TestCase):
         2026-09-21：原第三个端点 82.push2 在所有出口均失效，且引擎资金流字段实际取自
         push2delay 的 clist 接口，故移除；改为只保留主端点 + K线端点。若未来再加端点，
         必须是引擎真实依赖、且能区分不同出口的端点，否则只会同质化惩罚、掩盖真实差异。
+
+        2026-09-23：主端点扩为「push2 系任一端点可达即算通」——引擎本身就有多 host 回退，
+        探测只认单一 push2delay 会把可用路径误杀。主端点组内每个端点采样 ≥2 次。
         """
         self.assertGreaterEqual(len(np.PROBE_ENDPOINTS), 2)
         for item in np.PROBE_ENDPOINTS:
@@ -104,8 +123,16 @@ class NetworkPathTests(unittest.TestCase):
             self.assertIsInstance(params, dict)
             self.assertGreaterEqual(int(samples), 1)
         self.assertNotIn("82push2", [n for n, *_ in np.PROBE_ENDPOINTS])
+        samples = {n: s for n, _, _, s in np.PROBE_ENDPOINTS}
+        # 主端点组：至少两个 host，且每个都多次采样（单点单次采样会误杀路径）
+        self.assertGreaterEqual(len(np.PRIMARY_ENDPOINT_NAMES), 2)
+        for n in np.PRIMARY_ENDPOINT_NAMES:
+            self.assertIn(n, samples, f"主端点 {n} 必须在 PROBE_ENDPOINTS 中")
+            self.assertGreaterEqual(samples[n], 2, f"主端点 {n} 采样次数必须 ≥2")
         # K线端点必须多次采样：直连下存在约 1/3 概率的间歇 RemoteDisconnected
-        self.assertGreaterEqual(dict((n, s) for n, _, _, s in np.PROBE_ENDPOINTS)["push2his"], 2)
+        self.assertGreaterEqual(samples["push2his"], 2)
+        # 辅助端点不得混进主端点组（否则降级惩罚失效）
+        self.assertTrue(all(n in samples for n in np.PRIMARY_ENDPOINT_NAMES))
 
     # ---------- 排序与剔除 ----------
     def test_probe_paths_sorts_by_score(self):
