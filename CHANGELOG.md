@@ -2,6 +2,29 @@
 
 本文件记录源码、工具链和使用方式的主要变化。所有版本目前均为预览版，不代表稳定版或收益保证。
 
+## v0.4.2-preview.1 — 2026-09-23
+
+### 修复
+
+- **修复「看板全天误报『行情数据源降级』、锁死在旧快照」**：根因是**探测口径与引擎取数口径不一致**（两张皮），**不是东财封禁**。看板用 `network_path` 判「有无可用路径」，而它只有 `push2delay` 一个主端点、且**采样次数为 1**；实测该端点在本机是**间歇可用**（单次探测命中率仅约 40%~50%，失败多为 0.3~0.8s 的快速失败），单次采样约 2/3 概率把整条路径判死 ⇒ `has_working_path()` 为假 ⇒ 看板在启动引擎**之前**就跳过整轮。而引擎自身有 5 个 host 依次回退（`push2delay→push2→82/72/83.push2`），同时段（13:13:21）曾成功取到全量 56 页 / 5561 行 / `failed_pages=[]`。当日 13:14–13:50 全程误报，报告停在 10:21 与 13:14。
+  - `network_path.PROBE_ENDPOINTS`：新增 `push2.eastmoney.com`，与 `push2delay` 共同构成**主端点组** `PRIMARY_ENDPOINT_NAMES`，`_probe_one` 改为「组内任一端点可达即算该路径可用」（与引擎多 host 回退口径对齐）；主端点采样 1 → 3，`PROBE_TIMEOUT` 3.0 → 2.5s（用多采样换稳定性；失败是快速失败，加采样成本低）。
+  - `probe_paths()` 池超时公式修正：`(PROBE_TIMEOUT+1)×端点个数` → `PROBE_TIMEOUT×采样总次数+2`。原式漏算采样次数，加端点/加采样后全超时的最坏情况会超过池超时，把正在探测的可用路径吞成 `None`。
+  - `realtime_dashboard.run_screening`：删除「探测判死即 return、跳过整轮」的硬门禁，改为探测结果**只决定轮询间隔**（不通 → 15s 快轮询），引擎照常实跑；引擎实跑成功即复位 `proxy_unavailable`。
+  - 连带修复：界面「强制刷新」的 `force` 参数此前被该拦截吃掉（拦截分支不判断 `force`），如今 `force` 视为探测通过，按钮真正生效。
+- `SCREENING_TIMEOUT` 180 → 210：当日实测健康轮次 92s / 129s / 133s / **163.2s**，163s 距 180 仅 10% 余量，会被误判超时并打回旧快照。
+
+### 说明
+
+- 曾试加 `DEGRADED_SCREENING_TIMEOUT = 90`（探测失败时用短超时），**实测第一轮就跑满 163.2s 并成功出数**，证明 90s 必误杀正常轮次，已回退删除。教训：**不要用探测结果去砍超时**。
+- 探测侧遗留：本机东财 push2 系端点仍为间歇可用（`push2his` 常挂降级 3000ms 惩罚），属东财侧限流/链路水位而非本地故障——同一时刻网页端 `quote.eastmoney.com` 始终 200。
+- `network_path.diagnostics()` 新增 `primary_endpoints` 字段。
+
+### 验证
+
+- `test_network_path.py` **30 用例通过**（新增 `test_probe_one_accepts_any_primary_member`；主端点组判定、降级端点取样、端点表结构三处随改动同步）；`test_network_diagnostics.py` 8 用例、`test_rule_consistency.py` 6 用例通过。注意须用系统 Python（`%LOCALAPPDATA%\Programs\Python\Python313\python.exe`）——WorkBuddy 托管 Python 缺 tzdata，会在 `a_share_daily_screen.py:61` 的 `ZoneInfo("Asia/Shanghai")` 报错。
+- 探测可用率实测（看板进程视角连跑 5 轮 `warm_up`）：修复前 **2/5** → 修复后 **5/5**。
+- 重启看板后首轮：`screening done in 163.2s degraded=False`、`md_path=筛选结果/A股筛选结果_20260923_1412.md`、`preserve_snapshot=false`、`data_mode=live`。
+
 ## v0.4.1-preview.1 — 2026-09-21
 
 ### 新增
