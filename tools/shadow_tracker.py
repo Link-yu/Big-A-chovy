@@ -23,9 +23,24 @@ import json
 import re
 import argparse
 import importlib
+import copy
+import tempfile
+import threading
+import uuid
+from collections import Counter
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Callable, Dict, List, Any, Optional, Tuple
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - platform-specific import
+    fcntl = None
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - platform-specific import
+    msvcrt = None
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 TOOLS_DIR = Path(__file__).resolve().parent
@@ -34,62 +49,262 @@ for import_path in (PROJECT_ROOT, TOOLS_DIR, SCRIPTS_DIR):
     if str(import_path) not in sys.path:
         sys.path.insert(0, str(import_path))
 
-from tools.report_parser import parse_screening_report, get_report_files
+from tools.report_parser import parse_screening_report
 from tools.rule_config import (
     RULE_CONFIG,
-    hhmm_to_minutes,
     is_complete_shadow_result,
+    normalize_hhmm,
     shadow_targets,
 )
 
-SHADOW_DATA_DIR = Path(__file__).resolve().parent / "shadow_data"
+_shadow_dir_override = os.environ.get("A_SHARE_SHADOW_DATA_DIR", "").strip()
+SHADOW_DATA_DIR = (
+    Path(_shadow_dir_override).expanduser()
+    if _shadow_dir_override
+    else Path(__file__).resolve().parent / "shadow_data"
+)
 SHADOW_DB_FILE = SHADOW_DATA_DIR / "shadow_samples.json"
 T1_PENDING = "待补算"
 T1_SOURCE_DAILY_KLINE = "daily_kline"
 T1_SOURCE_REPORT_SNAPSHOTS_ONLY = "report_snapshots_only"
 T1_SOURCE_UNAVAILABLE = "unavailable"
+T1_SOURCE_LEGACY_UNVERIFIED = "legacy_unverified"
+_DB_THREAD_LOCK = threading.RLock()
+
+
+class ShadowDatabaseError(ValueError):
+    """The on-disk shadow database is malformed and must not be overwritten."""
+
+
+class ShadowDatabaseConflict(ShadowDatabaseError):
+    """A stale whole-database snapshot would remove or overwrite newer data."""
+
+
+def _msvcrt_lock_available() -> bool:
+    """Return whether the Windows byte-range locking primitive is usable."""
+    return msvcrt is not None and all(
+        getattr(msvcrt, name, None) is not None
+        for name in ("locking", "LK_LOCK", "LK_UNLCK")
+    )
+
+
+def _prepare_msvcrt_lock_file(handle) -> None:
+    """Ensure byte zero exists before asking msvcrt to lock it.
+
+    ``msvcrt.locking`` locks ``nbytes`` from the descriptor's current file
+    position and may lock beyond EOF.  An explicit byte makes creation and
+    cleanup deterministic across Windows filesystems and Python runtimes.
+    """
+    handle.seek(0, os.SEEK_END)
+    if handle.tell() < 1:
+        handle.seek(0)
+        handle.write(b"\0")
+        handle.flush()
+        os.fsync(handle.fileno())
+    handle.seek(0)
+
+
+def _empty_db() -> Dict[str, Any]:
+    targets = shadow_targets()
+    return {
+        "version": "2.0",
+        "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "targets": targets,
+        "samples": {category: [] for category in targets},
+    }
+
+
+def _validate_db(db: Any) -> Dict[str, Any]:
+    if not isinstance(db, dict):
+        raise ShadowDatabaseError("影子样本库顶层结构不是对象")
+    normalized = copy.deepcopy(db)
+    targets = normalized.setdefault("targets", {})
+    samples = normalized.setdefault("samples", {})
+    if not isinstance(targets, dict) or not isinstance(samples, dict):
+        raise ShadowDatabaseError("影子样本库 targets/samples 必须是对象")
+    for category, meta in targets.items():
+        if not isinstance(meta, dict):
+            raise ShadowDatabaseError(f"影子样本库 targets.{category} 必须是对象")
+    for category, rows in samples.items():
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise ShadowDatabaseError(f"影子样本库 samples.{category} 必须是对象数组")
+        if any(row.get("t1_result") is not None and not isinstance(row.get("t1_result"), dict) for row in rows):
+            raise ShadowDatabaseError(f"影子样本库 samples.{category} 的 t1_result 必须是对象或 null")
+    for category, meta in shadow_targets().items():
+        targets.setdefault(category, dict(meta))
+        samples.setdefault(category, [])
+    for category in set(targets) | set(samples):
+        targets.setdefault(category, {"name": category, "target_samples": int(RULE_CONFIG["shadow"]["target_samples"])})
+        samples.setdefault(category, [])
+        target = targets[category].get("target_samples")
+        if isinstance(target, bool) or not isinstance(target, int) or target <= 0:
+            raise ShadowDatabaseError(f"影子样本库 targets.{category}.target_samples 必须是正整数")
+    normalized.setdefault("version", "2.0")
+    normalized.setdefault("last_updated", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    return normalized
+
+
+@contextmanager
+def _database_lock():
+    """Serialize a complete database transaction across threads and processes."""
+    if fcntl is None and not _msvcrt_lock_available():
+        raise ShadowDatabaseError(
+            "当前平台没有可用的跨进程文件锁，拒绝写入影子样本库以避免并发丢失历史"
+        )
+    SHADOW_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = SHADOW_DB_FILE.with_name(f".{SHADOW_DB_FILE.name}.lock")
+    with _DB_THREAD_LOCK:
+        with lock_path.open("a+b") as handle:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                return
+
+            # Windows has no fcntl.  Use the C runtime's byte-range lock
+            # instead of silently downgrading to a thread lock or allowing an
+            # unsafe write.  LK_LOCK retries for a bounded period; failure is
+            # still a write refusal.
+            _prepare_msvcrt_lock_file(handle)
+            try:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            except OSError as exc:
+                raise ShadowDatabaseError(
+                    "无法获取 Windows 跨进程文件锁，拒绝写入影子样本库以避免并发丢失历史"
+                ) from exc
+            try:
+                yield
+            finally:
+                # The locked region starts at the descriptor's current
+                # position; seek back before unlocking, including after an
+                # exception in the transaction body.
+                pending_error = sys.exc_info()
+                try:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError as exc:
+                    # Preserve a transaction exception if there is one; on a
+                    # normal exit, an unlock failure is itself a write
+                    # refusal rather than a silent safety downgrade.
+                    if pending_error[0] is None:
+                        raise ShadowDatabaseError(
+                            "无法释放 Windows 跨进程文件锁，拒绝完成影子样本库写入"
+                        ) from exc
+
+
+def _atomic_save_db(db: Dict[str, Any]) -> None:
+    validated = _validate_db(db)
+    validated["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    serialized = json.dumps(validated, ensure_ascii=False, indent=2, allow_nan=False)
+    temp_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=SHADOW_DATA_DIR,
+            prefix=f".{SHADOW_DB_FILE.name}.", suffix=f".{uuid.uuid4().hex}.tmp", delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, SHADOW_DB_FILE)
+        try:
+            dir_fd = os.open(SHADOW_DATA_DIR, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+        db.clear()
+        db.update(validated)
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def init_db() -> Dict[str, Any]:
     """初始化或加载影子样本数据库。"""
-    SHADOW_DATA_DIR.mkdir(parents=True, exist_ok=True)
     if SHADOW_DB_FILE.exists():
         try:
             data = json.loads(SHADOW_DB_FILE.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                data.setdefault("targets", {})
-                data.setdefault("samples", {})
-                # 迁移：为新配置登记的类别补齐空结构，但不覆盖已有样本
-                # 或旧目标值；目标值漂移由 validate_consistency.py 报告。
-                for category, meta in shadow_targets().items():
-                    data["targets"].setdefault(category, dict(meta))
-                    data["samples"].setdefault(category, [])
-                return data
-        except Exception:
-            pass
-    return {
-        "version": "2.0",
-        "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "targets": shadow_targets(),
-        "samples": {category: [] for category in shadow_targets()},
-    }
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ShadowDatabaseError(f"影子样本库 JSON 无法读取，拒绝覆盖: {exc}") from exc
+        return _validate_db(data)
+    return _empty_db()
+
+
+def _snapshot_signature(row: Dict[str, Any]) -> str:
+    return json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def _assert_snapshot_preserves_current(current: Dict[str, Any], candidate: Dict[str, Any]) -> None:
+    """Reject stale whole-file snapshots that omit or alter committed data."""
+    for key, value in current.items():
+        if key == "last_updated":
+            continue
+        if key not in candidate or candidate[key] != value:
+            if key in {"targets", "samples"}:
+                continue
+            raise ShadowDatabaseConflict(f"旧快照缺少或改写了数据库字段 {key!r}，拒绝覆盖")
+
+    current_targets = current.get("targets") or {}
+    candidate_targets = candidate.get("targets") or {}
+    for category, metadata in current_targets.items():
+        if candidate_targets.get(category) != metadata:
+            raise ShadowDatabaseConflict(
+                f"旧快照未保留较新的目标配置 {category!r}，拒绝覆盖"
+            )
+
+    current_samples = current.get("samples") or {}
+    candidate_samples = candidate.get("samples") or {}
+    for category, current_rows in current_samples.items():
+        proposed_rows = candidate_samples.get(category)
+        if proposed_rows is None:
+            raise ShadowDatabaseConflict(f"旧快照缺少类别 {category!r}，拒绝覆盖")
+        required = Counter(_snapshot_signature(row) for row in current_rows)
+        proposed = Counter(_snapshot_signature(row) for row in proposed_rows)
+        if required - proposed:
+            raise ShadowDatabaseConflict(
+                f"旧快照会删除或改写 {category!r} 类中已提交的样本，拒绝覆盖"
+            )
+
+
+def mutate_db(mutator: Callable[[Dict[str, Any]], Any]) -> Tuple[Any, Dict[str, Any]]:
+    """Run read → mutate → validate → atomic commit under one process lock.
+
+    The callback receives the latest database snapshot while the interprocess
+    lock is held and must mutate it in place. The result and committed snapshot
+    are returned after the lock-protected write succeeds.
+    """
+    with _database_lock():
+        db = init_db()
+        result = mutator(db)
+        validated = _validate_db(db)
+        _atomic_save_db(validated)
+        return result, copy.deepcopy(validated)
 
 
 def save_db(db: Dict[str, Any]) -> None:
-    """持久化保存影子样本数据库。"""
-    SHADOW_DATA_DIR.mkdir(parents=True, exist_ok=True)
-    db["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    SHADOW_DB_FILE.write_text(json.dumps(db, ensure_ascii=False, indent=2), encoding="utf-8")
+    """Save a snapshot only if it still contains every currently committed value.
 
+    New rows and targets can be added for compatibility with existing callers,
+    but a snapshot that predates another write is rejected instead of replacing
+    the newer database. Concurrent production writers should use ``mutate_db``.
+    """
+    candidate = _validate_db(db)
 
-def is_number(val: Any) -> bool:
-    if val is None or val in ("", "-", "--", "None"):
-        return False
-    try:
-        float(val)
-        return True
-    except (TypeError, ValueError):
-        return False
+    def commit_snapshot(current: Dict[str, Any]) -> None:
+        _assert_snapshot_preserves_current(current, candidate)
+        current.clear()
+        current.update(copy.deepcopy(candidate))
+
+    mutate_db(commit_snapshot)
 
 
 def parse_val(val_str: Any) -> float:
@@ -117,21 +332,40 @@ def collect_samples_from_report(filepath: str, db: Dict[str, Any]) -> int:
     rep = parse_screening_report(filepath)
     date_str = rep["date"]
     time_str = rep["time"]
+    if not re.fullmatch(r"\d{8}", str(date_str)):
+        raise ValueError(f"报告文件名缺少有效交易日期: {filepath}")
+    tables = rep.get("tables")
+    if not isinstance(tables, dict):
+        raise ValueError(f"报告表格结构异常: {filepath}")
+    for table_name in ("low_absorb_short", "tomorrow_watchlist", "capital_ranking"):
+        rows = tables.get(table_name) or []
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise ValueError(f"报告表格 {table_name} 结构异常: {filepath}")
 
+    samples = db.setdefault("samples", {})
+    if not isinstance(samples, dict):
+        raise ShadowDatabaseError("影子样本库 samples 必须是对象")
     for category in ("coalition", "breakout", "sector_boost"):
-        db.setdefault("samples", {}).setdefault(category, [])
+        rows = samples.setdefault(category, [])
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise ShadowDatabaseError(f"影子样本库 samples.{category} 必须是对象数组")
     existing_keys = {
-        cat: {f"{s['code']}_{s['date']}" for s in db["samples"][cat]}
+        cat: {
+            f"{str(sample.get('code')).strip()}_{str(sample.get('date')).strip()}"
+            for sample in samples[cat]
+            if sample.get("code") and sample.get("date")
+        }
         for cat in ("coalition", "breakout", "sector_boost")
     }
 
     added_count = 0
-    tables = rep.get("tables") or {}
 
     # 1. 采集 合力主升 (coalition) 样本（严格互斥：20% <= 超单占比 < 50%）
     low_short = tables.get("low_absorb_short") or []
     for r in low_short:
-        code = r.get("代码", "")
+        code = str(r.get("代码") or "").strip()
+        if not code:
+            continue
         name = r.get("名称", "")
         super_lead = r.get("超单主导", "")
         super_str = r.get("超大单", "0")
@@ -174,7 +408,9 @@ def collect_samples_from_report(filepath: str, db: Dict[str, Any]) -> int:
     # 2. 采集 观察池突破状态机 (breakout) 样本
     watchlist = tables.get("tomorrow_watchlist") or []
     for r in watchlist:
-        code = r.get("代码", "")
+        code = str(r.get("代码") or "").strip()
+        if not code:
+            continue
         name = r.get("名称", "")
         state = r.get("突破状态", "")
         price = parse_val(r.get("当前价", r.get("现价", "0")))
@@ -209,7 +445,9 @@ def collect_samples_from_report(filepath: str, db: Dict[str, Any]) -> int:
     # 3. 采集 主线板块协同 (sector_boost) 样本
     cap_rank = tables.get("capital_ranking") or []
     for r in cap_rank:
-        code = r.get("代码", "")
+        code = str(r.get("代码") or "").strip()
+        if not code:
+            continue
         name = r.get("名称", "")
         reason = (
             r.get("评分依据") or r.get("理由") or r.get("资金理由") or
@@ -241,27 +479,59 @@ def collect_samples_from_report(filepath: str, db: Dict[str, Any]) -> int:
     return added_count
 
 
-def find_next_trading_day_reports(reports_dir: str, date_str: str) -> List[str]:
-    """寻找指定日期的下一个交易日报告文件（支持递归子目录与各类文件名）。"""
-    dates_set = set()
-    if os.path.exists(reports_dir):
-        for root, dirs, files in os.walk(reports_dir):
-            for d in dirs:
-                if re.match(r"^\d{8}$", d):
-                    dates_set.add(d)
-            for f in files:
-                if f.endswith(".md"):
-                    m = re.search(r"(\d{8})", f)
-                    if m:
-                        dates_set.add(m.group(1))
+_TRADING_CALENDAR = None
 
-    sorted_dates = sorted(list(dates_set))
-    if date_str in sorted_dates:
-        idx = sorted_dates.index(date_str)
-        if idx + 1 < len(sorted_dates):
-            next_date = sorted_dates[idx + 1]
-            return get_report_files(reports_dir, next_date)
-    return []
+
+def _verified_next_trading_date(date_str: str) -> Optional[str]:
+    """Return the official next exchange date, or None when it cannot be verified."""
+    global _TRADING_CALENDAR
+    try:
+        normalized = datetime.strptime(str(date_str), "%Y%m%d").date()
+        if _TRADING_CALENDAR is None:
+            from tools.data_sources.cache import JsonCache
+            from tools.data_sources.calendar import TradingCalendarService
+
+            calendar_cache = JsonCache(
+                "shadow_tracker_calendar",
+                path=SHADOW_DATA_DIR / "trading_calendar_cache.json",
+            )
+            _TRADING_CALENDAR = TradingCalendarService(cache=calendar_cache, request_timeout=4.0)
+        result = _TRADING_CALENDAR.next_trading_day(normalized, max_days=370)
+        if result.status == "ok" and isinstance(result.data, dict):
+            target = datetime.strptime(result.data.get("date", ""), "%Y-%m-%d").date()
+            return target.strftime("%Y%m%d")
+    except Exception:
+        return None
+    return None
+
+
+def _all_report_files(reports_dir: str) -> List[str]:
+    """Enumerate report snapshots under flat, date-folder, and nested archives."""
+    found: List[Tuple[str, str, str]] = []
+    if not os.path.isdir(reports_dir):
+        return []
+    for root, _dirs, files in os.walk(reports_dir):
+        for filename in files:
+            if not filename.endswith(".md"):
+                continue
+            if not filename.startswith("A股筛选结果_"):
+                continue
+            match = re.search(r"(\d{8})_(\d{4})", filename)
+            if match:
+                found.append((match.group(1), match.group(2), os.path.join(root, filename)))
+    return [path for _day, _time, path in sorted(found)]
+
+
+def find_next_trading_day_reports(reports_dir: str, date_str: str) -> List[str]:
+    """Return only reports from a calendar-verified T+1 date; never infer across gaps."""
+    next_date = _verified_next_trading_date(date_str)
+    if not next_date:
+        return []
+    return [
+        path for path in _all_report_files(reports_dir)
+        if (match := re.search(r"(\d{8})_(\d{4})", os.path.basename(path)))
+        and match.group(1) == next_date
+    ]
 
 
 def pending_t1_label(reports_dir: str, date_str: str) -> str:
@@ -288,7 +558,7 @@ def fetch_t1_day_kline_extremes(code: str, t1_date: str) -> Optional[Tuple[float
             if row_date.replace("/", "-") == target_fmt.replace("/", "-"):
                 h = float(kr.get("high", 0))
                 l = float(kr.get("low", 0))
-                if h > 0 and l > 0:
+                if h > 0 and l > 0 and h >= l:
                     return h, l
     except Exception:
         pass
@@ -305,64 +575,49 @@ def calculate_t1_for_sample(sample: Dict[str, Any], t1_reports: List[str]) -> Op
     if trigger_price <= 0:
         return None
 
-    # 扫描次日所有快照，按共享配置中的目标时刻锁定 T+1 目标价格。
-    best_0945_diff = float("inf")
-    p_0945 = None
-    all_prices = []
-    t1_date = None
+    expected_t1_date = _verified_next_trading_date(str(sample.get("date") or ""))
+    if not expected_t1_date:
+        return None
+    target_time = normalize_hhmm(RULE_CONFIG["execution"]["t1_exit_window"]["target"])
+    target_text = f"{target_time[:2]}:{target_time[2:]}"
+    p_0945: Optional[float] = None
+    t1_date = expected_t1_date
 
     for r_file in t1_reports:
         try:
             rep = parse_screening_report(r_file)
-            t1_date = rep["date"]
+            if rep.get("date") != expected_t1_date:
+                continue
             t_str = rep.get("time", "")
+            try:
+                normalized_time = normalize_hhmm(t_str)
+            except (TypeError, ValueError):
+                normalized_time = ""
 
-            # 计算与配置目标时刻的时间差
-            time_diff = float("inf")
-            m = re.match(r"^(\d{1,2}):(\d{2})", t_str)
-            if m:
-                h, mi = int(m.group(1)), int(m.group(2))
-                target_minute = hhmm_to_minutes(
-                    RULE_CONFIG["execution"]["t1_exit_window"]["target"]
-                )
-                time_diff = abs((h * 60 + mi) - target_minute)
-
-            for table_name, rows in rep.get("tables", {}).items():
+            for rows in rep.get("tables", {}).values():
+                if not isinstance(rows, list):
+                    continue
                 for row in rows:
-                    if row.get("代码") == code:
+                    if isinstance(row, dict) and row.get("代码") == code:
+                        if normalized_time != target_time or p_0945 is not None:
+                            continue
                         price = parse_val(row.get("现价") or row.get("当前价") or row.get("价格"))
                         if price > 0:
-                            all_prices.append(price)
-                            # 提取表格中可能记录的最高价与最低价
-                            if is_number(row.get("最高")):
-                                all_prices.append(parse_val(row.get("最高")))
-                            if is_number(row.get("最低")):
-                                all_prices.append(parse_val(row.get("最低")))
-
-                            # 精确锁定距 09:45 最近的时间点
-                            if time_diff < best_0945_diff:
-                                best_0945_diff = time_diff
-                                p_0945 = price
+                            # 只接受共享规则定义的精确时刻，不以 09:44/09:46/收盘价代替。
+                            p_0945 = price
         except Exception:
             continue
 
-    if not all_prices:
-        return None
-
-    if p_0945 is None:
-        p_0945 = all_prices[0]
-
     # 结合日K获取全日真实极值（防止中途退出候选表导致漏统计日内极值）。
-    # 日K缺失时只能保留09:45快照收益，严禁用筛选快照冒充全日极值闭环。
+    # 缺少精确 09:45 快照时，目标价格/收益必须为空，不能回退到第一份快照。
     day_extremes = fetch_t1_day_kline_extremes(code, t1_date) if t1_date else None
     if day_extremes is not None:
         extremes_complete = True
-        p_high = max(max(all_prices), day_extremes[0])
-        p_low = min(min(all_prices), day_extremes[1])
+        p_high, p_low = day_extremes
     else:
         extremes_complete = False
 
-    t1_ret = (p_0945 - trigger_price) / trigger_price * 100
+    t1_ret = (p_0945 - trigger_price) / trigger_price * 100 if p_0945 is not None else None
     if extremes_complete:
         max_gain = round((p_high - trigger_price) / trigger_price * 100, 2)
         max_dd = round((p_low - trigger_price) / trigger_price * 100, 2)
@@ -377,10 +632,13 @@ def calculate_t1_for_sample(sample: Dict[str, Any], t1_reports: List[str]) -> Op
 
     return {
         # checked 表示完整T+1结算，不是“找到了某个报告快照”。
-        "checked": extremes_complete,
-        "t1_date": t1_date or "次日",
-        "t1_0945_price": round(p_0945, 2),
-        "t1_0945_return_pct": round(t1_ret, 2),
+        "checked": extremes_complete and p_0945 is not None,
+        "t1_date": t1_date,
+        "t1_date_verified": True,
+        "target_time": target_text,
+        "target_snapshot_found": p_0945 is not None,
+        "t1_0945_price": round(p_0945, 2) if p_0945 is not None else None,
+        "t1_0945_return_pct": round(t1_ret, 2) if t1_ret is not None else None,
         "t1_max_gain_pct": max_gain,
         "t1_max_drawdown_pct": max_dd,
         "is_false_breakout": is_false_breakout,
@@ -392,14 +650,58 @@ def calculate_t1_for_sample(sample: Dict[str, Any], t1_reports: List[str]) -> Op
 def update_all_t1_metrics(db: Dict[str, Any], reports_dir: Optional[str] = None) -> None:
     """自动核算所有样本的 T+1 次日真实表现（含 divergence 等全部机制类别）。"""
     reports_dir = reports_dir or os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "筛选结果"))
+    validated = _validate_db(db)
+    db.clear()
+    db.update(validated)
     for category in sorted(db["samples"].keys()):
         for sample in db["samples"][category]:
             date_str = sample["date"]
+            old_result = sample.get("t1_result")
+            legacy_evidence = None
+            try:
+                old_target_time_ok = (
+                    normalize_hhmm(old_result.get("target_time"))
+                    == normalize_hhmm(RULE_CONFIG["execution"]["t1_exit_window"]["target"])
+                ) if isinstance(old_result, dict) else False
+            except (TypeError, ValueError):
+                old_target_time_ok = False
+            if (
+                isinstance(old_result, dict)
+                and old_result.get("checked") is True
+                and old_result.get("extremes_complete") is True
+                and old_result.get("source") == T1_SOURCE_DAILY_KLINE
+                and (
+                    not old_target_time_ok
+                    or old_result.get("t1_date_verified") is not True
+                    or old_result.get("target_snapshot_found") is not True
+                )
+                and not old_result.get("legacy_evidence")
+            ):
+                legacy_evidence = {key: copy.deepcopy(value) for key, value in old_result.items() if key != "legacy_evidence"}
+                old_result["legacy_evidence"] = legacy_evidence
+                old_result["checked"] = False
+                old_result["extremes_complete"] = False
+                old_result["source"] = T1_SOURCE_LEGACY_UNVERIFIED
+                old_result["review_required"] = True
+                old_result["completeness_note"] = "旧结算未记录精确目标时点，需重新核验"
+
             t1_reports = find_next_trading_day_reports(reports_dir, date_str)
             if t1_reports:
                 res = calculate_t1_for_sample(sample, t1_reports)
                 if res:
-                    sample["t1_result"] = res
+                    if is_complete_shadow_result(old_result) and not is_complete_shadow_result(res):
+                        # A previously verified exact-time settlement survives later source outages.
+                        sample["t1_result"] = old_result
+                    else:
+                        if legacy_evidence is not None:
+                            res["legacy_evidence"] = legacy_evidence
+                            if not is_complete_shadow_result(res):
+                                res["review_required"] = True
+                        elif isinstance(old_result, dict) and old_result.get("legacy_evidence"):
+                            res["legacy_evidence"] = copy.deepcopy(old_result["legacy_evidence"])
+                            if not is_complete_shadow_result(res):
+                                res["review_required"] = True
+                        sample["t1_result"] = res
             if sample.get("t1_result") is None:
                 sample["t1_result"] = {
                     "checked": False,
@@ -412,6 +714,9 @@ def update_all_t1_metrics(db: Dict[str, Any], reports_dir: Optional[str] = None)
                     "extremes_complete": False,
                     "source": T1_SOURCE_UNAVAILABLE,
                 }
+                if legacy_evidence is not None:
+                    sample["t1_result"]["legacy_evidence"] = legacy_evidence
+                    sample["t1_result"]["review_required"] = True
             elif (
                 isinstance(sample.get("t1_result"), dict)
                 and not sample["t1_result"].get("checked")
@@ -441,8 +746,15 @@ def generate_report(db: Dict[str, Any]) -> str:
         evaluated_samples = [s for s in samples if is_complete_shadow_result(s.get("t1_result"))]
         pending_extremes = any(
             s.get("t1_result")
-            and s["t1_result"].get("extremes_complete") is False
+            and not is_complete_shadow_result(s["t1_result"])
+            and s["t1_result"].get("extremes_complete") is not True
             and s["t1_result"].get("t1_0945_price") is not None
+            for s in samples
+        )
+        pending_target = any(
+            s.get("t1_result")
+            and not is_complete_shadow_result(s["t1_result"])
+            and s["t1_result"].get("target_snapshot_found") is not True
             for s in samples
         )
         if evaluated_samples:
@@ -453,7 +765,10 @@ def generate_report(db: Dict[str, Any]) -> str:
             avg_dd = f"{sum(s['t1_result']['t1_max_drawdown_pct'] for s in evaluated_samples) / len(evaluated_samples):+.2f}%"
             false_bo = f"{sum(1 for s in evaluated_samples if s['t1_result'].get('is_false_breakout')) / len(evaluated_samples) * 100:.1f}%"
         else:
-            win_rate = "0.0% (待补算日K极值)" if pending_extremes else "0.0% (待下一个交易日结算)"
+            win_rate = (
+                "0.0% (待补精确09:45快照)" if pending_target
+                else ("0.0% (待补算日K极值)" if pending_extremes else "0.0% (待下一个交易日结算)")
+            )
             avg_ret = "0.00%"
             avg_gain = "0.00%"
             avg_dd = "0.00%"
@@ -480,51 +795,56 @@ def generate_report(db: Dict[str, Any]) -> str:
                     else (f"状态:{s.get('state')} 触发基准:{s.get('benchmark_trigger')}" if cat == "breakout"
                           else (f"场景:{s.get('scenario','-')} 主力:{s.get('mainp_pct',0)}% 超单:{s.get('xl_wan',0):+.0f}万 回落:{s.get('pullback_pct',0)}%"
                                 if cat == "divergence"
-                                else f"协同评分:{s.get('score')} (+15分)"))
+                                else f"协同评分:{s.get('score', '-')} (+{s.get('boost_points', 15)}分)"))
                 )
                 t1_res = s.get("t1_result") or {}
                 t1_txt = t1_res.get("t1_0945_return_pct")
                 t1_disp = f"{t1_txt:+.2f}%" if t1_txt is not None else "-"
-                if t1_res.get("checked") and t1_res.get("extremes_complete") is True:
+                if is_complete_shadow_result(t1_res):
                     status_disp = f"✅ 已核算({t1_res.get('t1_date')})"
+                elif t1_res.get("review_required"):
+                    status_disp = "⚠️ 旧结算缺少目标时点，待复核"
+                elif t1_res.get("target_snapshot_found") is False:
+                    status_disp = f"⏳ 缺少精确{t1_res.get('target_time') or '09:45'}目标快照"
                 elif t1_res.get("extremes_complete") is False and t1_res.get("t1_0945_price") is not None:
                     status_disp = f"⏳ 待补算日K极值({t1_res.get('source', T1_SOURCE_REPORT_SNAPSHOTS_ONLY)})"
                 else:
                     status_disp = "⏳ 待下一个交易日结算"
-                lines.append(f"| `{s['id']}` | {s['code']} | {s['name']} | {s['date']} | {s['trigger_time']} | {s['trigger_price']:.2f} | {s['plate']} | {feat} | {t1_disp} | {status_disp} |")
+                lines.append(
+                    f"| `{s.get('id', '-')}` | {s.get('code', '-')} | {s.get('name', '-')} | {s.get('date', '-')} | "
+                    f"{s.get('trigger_time', '-')} | {parse_val(s.get('trigger_price')):.2f} | {s.get('plate', '-')} | "
+                    f"{feat} | {t1_disp} | {status_disp} |"
+                )
         else:
             lines.append("*（暂无样本）*")
 
     return "\n".join(lines)
 
 
-def scan_and_update(date_str: Optional[str] = None) -> None:
-    # 强制重构并重新从报告解析以保证核心三类样本严格互斥。
-    # divergence 等旁路类样本由各自检测器（如 detect_divergence_leader.py --record）
-    # 全日序列判定维护，本扫描原样保留，避免重建核心三类时被覆盖清除。
-    previous = init_db()
-    db = {
-        "version": "2.0",
-        "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "targets": shadow_targets(),
-        "samples": {category: [] for category in ("coalition", "breakout", "sector_boost")},
-    }
-    for cat, arr in previous.get("samples", {}).items():
-        if cat not in db["samples"] and arr:
-            db["targets"][cat] = previous.get("targets", {}).get(
-                cat, {"name": cat, "target_samples": 20})
-            db["samples"][cat] = arr
-    reports_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "筛选结果"))
-    files = get_report_files(reports_dir, date_str)
-    
-    total_added = 0
-    for f in files:
-        added = collect_samples_from_report(f, db)
-        total_added += added
+def scan_and_update(date_str: Optional[str] = None, reports_dir: Optional[str] = None) -> None:
+    """Accumulate samples from all history (or one requested date) and settle them safely."""
+    if date_str is not None and not re.fullmatch(r"\d{8}", str(date_str)):
+        raise ValueError("--date 必须为 YYYYMMDD")
+    reports_dir = reports_dir or os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "筛选结果"))
 
-    update_all_t1_metrics(db)
-    save_db(db)
-    print(f"=== 影子系统扫描完成：新增/更新 {total_added} 个样本，当前总样本库状态已更新 ===")
+    def merge_scan(db: Dict[str, Any]) -> int:
+        total_added = 0
+        files = _all_report_files(reports_dir)
+        if date_str is not None:
+            files = [
+                path for path in files
+                if (match := re.search(r"(\d{8})_(\d{4})", os.path.basename(path)))
+                and match.group(1) == date_str
+            ]
+        for report_path in files:
+            total_added += collect_samples_from_report(report_path, db)
+        update_all_t1_metrics(db, reports_dir=reports_dir)
+        return total_added
+
+    # The shared transaction owns the lock before loading the latest snapshot.
+    total_added, db = mutate_db(merge_scan)
+
+    print(f"=== 影子系统扫描完成：新增 {total_added} 个样本，当前总样本库状态已更新 ===")
     print(generate_report(db))
 
 

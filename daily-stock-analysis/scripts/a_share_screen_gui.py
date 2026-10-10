@@ -45,10 +45,9 @@ def _fetch_sector_boards() -> dict[str, dict]:
         query = "&".join(f"{k}={v}" for k, v in params.items())
         ok = False
         for host in ["push2.eastmoney.com", "82.push2.eastmoney.com"]:
-            url = f"https://{host}/api/qt/clist/get?{query}"
+            url = f"https://{host}/webguest/api/qt/clist/get?{query}"
             try:
                 req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                ctx = ssl._create_unverified_context()
                 with build_url_opener(NETWORK_MODE).open(req, timeout=10) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                 boards = ((data.get("data") or {}).get("diff") or [])
@@ -90,13 +89,12 @@ def _fetch_stock_industries(codes: list[str]) -> dict[str, str]:
     }
     query = "&".join(f"{k}={v}" for k, v in params.items())
     urls = [
-        f"https://push2.eastmoney.com/api/qt/ulist.np/get?{query}",
-        f"https://82.push2.eastmoney.com/api/qt/ulist.np/get?{query}",
+        f"https://push2.eastmoney.com/webguest/api/qt/ulist.np/get?{query}",
+        f"https://82.push2.eastmoney.com/webguest/api/qt/ulist.np/get?{query}",
     ]
     for url in urls:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            ctx = ssl._create_unverified_context()
             with build_url_opener(NETWORK_MODE).open(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             result = {}
@@ -412,14 +410,13 @@ class App:
             }
             query = "&".join(f"{k}={v}" for k, v in params.items())
             urls = [
-                f"https://82.push2.eastmoney.com/api/qt/ulist.np/get?{query}",
-                f"https://push2.eastmoney.com/api/qt/ulist.np/get?{query}",
+                f"https://82.push2.eastmoney.com/webguest/api/qt/ulist.np/get?{query}",
+                f"https://push2.eastmoney.com/webguest/api/qt/ulist.np/get?{query}",
             ]
             data = None
             for url in urls:
                 try:
                     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                    ctx = ssl._create_unverified_context()
                     with build_url_opener(NETWORK_MODE).open(req, timeout=10) as resp:
                         data = json.loads(resp.read().decode("utf-8"))
                     break
@@ -477,10 +474,9 @@ class App:
             }
             query = "&".join(f"{k}={v}" for k, v in params.items())
             for host in ["push2.eastmoney.com", "82.push2.eastmoney.com"]:
-                url = f"https://{host}/api/qt/ulist.np/get?{query}"
+                url = f"https://{host}/webguest/api/qt/ulist.np/get?{query}"
                 try:
                     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                    ctx = ssl._create_unverified_context()
                     with build_url_opener(NETWORK_MODE).open(req, timeout=10) as resp:
                         data = json.loads(resp.read().decode("utf-8"))
                     price_map: dict[str, float] = {}

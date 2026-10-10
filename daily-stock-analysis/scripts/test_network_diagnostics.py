@@ -1,8 +1,12 @@
 import contextlib
 import io
+import threading
+import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+import a_share_daily_screen as screen
+import realtime_engine as realtime
 from a_share_daily_screen import (
     MARKET_WARNINGS,
     NetworkUnavailable,
@@ -15,6 +19,99 @@ from a_share_daily_screen import (
 
 
 class NetworkDiagnosticsTests(unittest.TestCase):
+    def setUp(self):
+        # 熔断、主机失败记录、K 线缓存都是模块级状态，测试之间必须复位，否则用例顺序会影响结果
+        screen._tencent_kline_fail_streak = 0
+        screen._tencent_kline_blocked_until = 0.0
+        screen._sina_kline_fallback_warned = True
+        screen._HOST_FAILURES.clear()
+        realtime._kline_cache = {}
+        realtime._kline_cache_date = realtime._today()
+
+    def test_known_blocked_list_endpoints_use_webguest_routes(self):
+        self.assertTrue(all("/webguest/api/qt/clist/get" in url for url in screen.CLIST_URLS))
+        self.assertTrue(all("/webguest/api/qt/clist/get" in url for url in screen.CLIST_STARTUP_URLS))
+        self.assertTrue(all("/webguest/api/qt/ulist.np/get" in url for url in screen.INDEX_URLS))
+        self.assertTrue(all("push2delay.eastmoney.com" not in url for url in screen.CLIST_URLS + screen.INDEX_URLS))
+        self.assertTrue(all("/webguest/api/qt/stock/fflow/kline/get" in url
+                            for url in screen.EM_FFLOW_MINUTE_URLS))
+        self.assertIn("/webguest/api/qt/stock/trends2/get", realtime.EM_TRENDS_URL)
+
+    def test_fetch_kline_prefers_tencent_qfq(self):
+        rows = [f"2026-06-{i:02d},10,10.5,11,9.5,1000" for i in range(1, 71)]
+        response = {"data": {"sh600519": {"qfqday": rows}}}
+        with patch.object(screen, "fetch_json", return_value=response) as fetch:
+            parsed, source = screen.fetch_kline("600519", 90)
+
+        self.assertEqual(source, "tencent_qfq")
+        self.assertEqual(len(parsed), 70)
+        self.assertEqual(fetch.call_count, 1)
+        self.assertEqual(fetch.call_args.args[0], screen.TENCENT_KLINE_URL)
+
+    def test_fetch_kline_falls_back_to_sina_when_tencent_fails(self):
+        """腾讯与东财两档都不可用时，才落到新浪末档；三档主机都要被尝试过。
+
+        2026-09-28 更新：链路改为 腾讯（主）→ 东财 push2his（备，前复权）→ 新浪（末档，不复权）。
+        东财档同日复测已恢复，因此这里把东财主机也设为失败，才是在测"末档兜底"这件事本身。
+        """
+        rows = [{"day": f"2026-06-{i:02d}", "open": "10", "high": "11",
+                 "low": "9.5", "close": "10.5", "volume": "1000"} for i in range(1, 71)]
+
+        def fake_fetch(url, params=None, **kwargs):
+            if "gtimg" in url or "qq.com" in url or "push2his" in url:
+                raise NetworkUnavailable(url, {})
+            return rows
+
+        with patch.object(screen, "fetch_json", side_effect=fake_fetch) as fetch:
+            parsed, source = screen.fetch_kline("600519", 90)
+
+        self.assertEqual(source, "sina_daily")
+        self.assertEqual(len(parsed), 70)
+        self.assertEqual(fetch.call_args_list[-1].args[0], screen.SINA_KLINE_URL)
+        tencent_hosts = {c.args[0] for c in fetch.call_args_list
+                         if c.args[0].endswith("/appstock/app/fqkline/get")}
+        self.assertEqual(tencent_hosts, set(screen.TENCENT_KLINE_URLS))
+        eastmoney_hosts = {c.args[0] for c in fetch.call_args_list
+                           if c.args[0] in screen.EM_KLINE_URLS}
+        self.assertEqual(eastmoney_hosts, set(screen.EM_KLINE_URLS),
+                         "东财档也必须被尝试过，否则不算'两档都不可用'")
+
+    def test_tencent_kline_circuit_opens_after_repeated_failures(self):
+        """连续失败后熔断腾讯日 K：避免 WAF 拦截页把一轮 76 只放大成上百次请求。"""
+        with patch.object(screen, "fetch_json",
+                          side_effect=NetworkUnavailable("tencent", {})) as fetch:
+            for _ in range(5):
+                with self.assertRaises(RuntimeError):
+                    screen.fetch_kline("600519", 90)
+
+        tencent_calls = [c for c in fetch.call_args_list
+                         if c.args and c.args[0] == screen.TENCENT_KLINE_URL]
+        self.assertEqual(len(tencent_calls), screen.TENCENT_KLINE_FAIL_STREAK_LIMIT)
+
+    def test_tencent_kline_circuit_resets_on_success(self):
+        rows = [f"2026-06-{i:02d},10,10.5,11,9.5,1000" for i in range(1, 71)]
+        response = {"data": {"sh600519": {"qfqday": rows}}}
+        screen._tencent_kline_fail_streak = screen.TENCENT_KLINE_FAIL_STREAK_LIMIT - 1
+        with patch.object(screen, "fetch_json", return_value=response):
+            parsed, source = screen.fetch_kline("600519", 90)
+
+        self.assertEqual(source, "tencent_qfq")
+        self.assertEqual(screen._tencent_kline_fail_streak, 0)
+        self.assertEqual(len(parsed), 70)
+
+    def test_tencent_kline_fails_over_between_hosts(self):
+        """2026-09-26：web.ifzq.gtimg.cn 被 WAF 拦截，同一接口在 ifzq.gtimg.cn 上仍可用。"""
+        rows = [f"2026-06-{i:02d},10,10.5,11,9.5,1000" for i in range(1, 71)]
+        response = {"data": {"sh600519": {"qfqday": rows}}}
+        with patch.object(screen, "fetch_json",
+                          side_effect=[NetworkUnavailable("waf", {}), response]) as fetch:
+            parsed, source = screen.fetch_kline("600519", 90)
+
+        self.assertEqual(source, "tencent_qfq")
+        self.assertEqual(len(parsed), 70)
+        self.assertIn(fetch.call_args_list[1].args[0], screen.TENCENT_KLINE_URLS)
+        self.assertNotEqual(fetch.call_args_list[0].args[0], fetch.call_args_list[1].args[0])
+
     def test_failure_message_keeps_proxy_and_direct_evidence(self):
         error = NetworkUnavailable(
             "https://push2delay.eastmoney.com/api/qt/clist/get",
@@ -84,6 +181,10 @@ class NetworkDiagnosticsTests(unittest.TestCase):
     @patch("a_share_daily_screen.filter_prefetch", return_value=[])
     @patch("a_share_daily_screen.save_intersection_state")
     @patch("a_share_daily_screen.load_intersection_state", return_value={})
+    # 观察池突破状态与交集状态一样必须挡住：这条用例跑的是真实的 main()，
+    # 漏挡会把**本机真实运行状态**按今天的日期覆盖掉（盘中状态机依赖该文件）。
+    @patch("a_share_daily_screen.save_watchlist_breakout_state")
+    @patch("a_share_daily_screen.load_watchlist_breakout_state", return_value={})
     @patch("a_share_daily_screen.save_flow_history")
     @patch("a_share_daily_screen.load_flow_history", return_value={})
     @patch("a_share_daily_screen.enrich_all", return_value=([], []))
@@ -152,6 +253,97 @@ class NetworkDiagnosticsTests(unittest.TestCase):
         self.assertTrue(status["complete"])
         self.assertEqual(status["failed_pages"], [])
         self.assertEqual(len(rows), 200)
+
+
+class SinaReachableTests(unittest.TestCase):
+    VALID_ROW = {
+        "symbol": "sh600000", "name": "浦发银行", "trade": "10.00",
+        "settlement": "9.80", "changepercent": "2.04",
+    }
+
+    @patch("a_share_daily_screen.fetch_json")
+    def test_sina_reachable_requires_a_normalizable_quote(self, fetch_json):
+        import realtime_dashboard as dash
+
+        fetch_json.return_value = [self.VALID_ROW]
+        self.assertTrue(dash._sina_reachable())
+        self.assertIn("deadline", fetch_json.call_args.kwargs)
+        self.assertEqual(fetch_json.call_args.kwargs["retries"], 0)
+
+    @patch("a_share_daily_screen.fetch_json")
+    def test_sina_reachable_rejects_empty_malformed_and_false_positive_rows(self, fetch_json):
+        import realtime_dashboard as dash
+
+        for payload in ([], {}, [{"symbol": "sh600000"}], [{**self.VALID_ROW, "trade": "-"}], [None]):
+            with self.subTest(payload=payload):
+                fetch_json.return_value = payload
+                self.assertFalse(dash._sina_reachable())
+
+    @patch("a_share_daily_screen.fetch_json", side_effect=RuntimeError("offline"))
+    def test_sina_reachable_rejects_provider_errors(self, _fetch_json):
+        import realtime_dashboard as dash
+
+        self.assertFalse(dash._sina_reachable())
+
+    def test_sina_reachability_probe_returns_at_its_deadline(self):
+        import realtime_dashboard as dash
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        def stalled(*_args, **_kwargs):
+            entered.set()
+            release.wait(timeout=2)
+            return [self.VALID_ROW]
+
+        started = time.monotonic()
+        with patch("a_share_daily_screen.fetch_json", side_effect=stalled):
+            self.assertFalse(dash._sina_reachable(timeout=0.05))
+        elapsed = time.monotonic() - started
+        release.set()
+        self.assertTrue(entered.wait(timeout=0.2))
+        self.assertLess(elapsed, 0.3)
+
+    def test_sina_fetch_uses_independent_candidate_paths_with_deadline(self):
+        session = Mock()
+        session.get.return_value.json.return_value = [self.VALID_ROW]
+        deadline = time.monotonic() + 2
+        with patch.object(screen, "NETWORK_MODE", "auto"), \
+             patch.object(screen, "requests", object()), \
+             patch.object(screen.network_path, "ordered_independent_sessions", return_value=[("代理A", session)]) as routes, \
+             patch.object(screen.network_path, "ordered_sessions", side_effect=AssertionError("Eastmoney-only path list used")):
+            data = screen.fetch_json(screen.SINA_MARKET_URL, {"num": 1}, deadline=deadline)
+
+        self.assertEqual(data, [self.VALID_ROW])
+        routes.assert_called_once_with(screen.REQUESTS_DIRECT_SESSION, deadline=deadline)
+        self.assertLessEqual(session.get.call_args.kwargs["timeout"], 2)
+
+    def test_sina_fetch_stdlib_fallback_uses_synthetic_opener(self):
+        import json
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps([self_row]).encode("utf-8")
+
+        self_row = self.VALID_ROW
+        opener = Mock()
+        opener.open.return_value = FakeResponse()
+        deadline = time.monotonic() + 2
+        with patch.object(screen, "NETWORK_MODE", "auto"), \
+             patch.object(screen, "requests", None), \
+             patch.object(screen.network_path, "independent_path_candidates", return_value=[("直连", None)]) as routes, \
+             patch.object(screen.urllib.request, "build_opener", return_value=opener):
+            data = screen.fetch_json(screen.SINA_MARKET_URL, {"num": 1}, deadline=deadline)
+
+        self.assertEqual(data, [self.VALID_ROW])
+        routes.assert_called_once_with(deadline=deadline)
+        self.assertLessEqual(opener.open.call_args.kwargs["timeout"], 2)
 
 
 if __name__ == "__main__":

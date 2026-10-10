@@ -7,6 +7,7 @@
 
 import json
 import os
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -31,6 +32,8 @@ class NetworkPathTests(unittest.TestCase):
         np.invalidate()
         np._current_label = None
         np._last_switch_reason = ""
+        np._independent_candidates = None
+        np._independent_candidates_at = 0.0
         np._fail_streak.clear()
         np._cooldown_until.clear()
 
@@ -66,73 +69,32 @@ class NetworkPathTests(unittest.TestCase):
     def test_is_em_json_accepts_eastmoney_shapes(self):
         self.assertTrue(np._is_em_json({"rc": 0, "data": {}}))
         self.assertTrue(np._is_em_json({"data": {"total": 1}}))
+        self.assertFalse(np._is_em_json({"rc": 102, "data": None}))
         self.assertFalse(np._is_em_json({"error": "x"}))   # 本地端口误答 200
         self.assertFalse(np._is_em_json([1, 2, 3]))
         self.assertFalse(np._is_em_json(None))
 
+    def test_primary_probe_uses_the_webguest_list_endpoint(self):
+        name, url, _ = np.PROBE_ENDPOINTS[0]
+        self.assertEqual(name, "webguest")
+        self.assertIn("/webguest/api/qt/clist/get", url)
+
     def test_probe_one_requires_primary_endpoint(self):
-        """主端点组（push2 系）**全部**不通 → 整条路径废弃。"""
+        primary = np.PROBE_ENDPOINTS[0][0]
         with patch.object(np, "_probe_all",
-                          return_value={name: (None if name in np.PRIMARY_ENDPOINT_NAMES else 10.0)
-                                        for name, *_ in np.PROBE_ENDPOINTS}):
+                          return_value={name: (None if name == primary else 10.0)
+                                        for name, _, _ in np.PROBE_ENDPOINTS}):
             self.assertIsNone(np._probe_one("直连", None))
-
-    def test_probe_one_accepts_any_primary_member(self):
-        """主端点组内只要一端可达，路径即可用（与引擎多 host 回退口径对齐）。
-
-        2026-09-23 回归：push2delay 直连成功率仅约 1/3，若只认它单点，
-        约 2/3 的探测会误杀路径，导致看板全天误报「数据源降级」。
-        """
-        name = np.PRIMARY_ENDPOINT_NAMES[0]
-        raw = {n: 100.0 for n, *_ in np.PROBE_ENDPOINTS}
-        raw[name] = None                     # 首个主端点不通，组内其余仍通
-        with patch.object(np, "_probe_all", return_value=raw):
-            got = np._probe_one("直连", None)
-        self.assertIsNotNone(got, "组内其它主端点可达时不得判死")
-        self.assertNotIn(name, got["degraded"], "主端点组成员不通不计入降级惩罚")
 
     def test_probe_one_penalizes_degraded_endpoints(self):
         """辅助端点不通时路径仍可用，但要吃排序惩罚并被标记降级。"""
-        aux = [n for n, *_ in np.PROBE_ENDPOINTS if n not in np.PRIMARY_ENDPOINT_NAMES]
-        self.assertTrue(aux, "应至少有一个辅助端点（K线）")
-        raw = {n: 100.0 for n, *_ in np.PROBE_ENDPOINTS}
-        for n in aux:
-            raw[n] = None                 # 辅助端点（K线）不通
+        names = [n for n, _, _ in np.PROBE_ENDPOINTS]
+        raw = {names[0]: 100.0, names[1]: None, names[2]: 120.0}
         with patch.object(np, "_probe_all", return_value=raw):
             got = np._probe_one("直连", None)
         self.assertIsNotNone(got)
-        self.assertEqual(got["degraded"], aux)
-        self.assertAlmostEqual(got["score"], 100.0 + np.DEGRADE_PENALTY_MS * len(aux), places=1)
-
-    def test_probe_endpoints_structure_and_stability(self):
-        """端点表为四元组 (名称, URL, 参数, 采样次数)；采样次数用于抵御间歇性断连。
-
-        2026-09-21：原第三个端点 82.push2 在所有出口均失效，且引擎资金流字段实际取自
-        push2delay 的 clist 接口，故移除；改为只保留主端点 + K线端点。若未来再加端点，
-        必须是引擎真实依赖、且能区分不同出口的端点，否则只会同质化惩罚、掩盖真实差异。
-
-        2026-09-23：主端点扩为「push2 系任一端点可达即算通」——引擎本身就有多 host 回退，
-        探测只认单一 push2delay 会把可用路径误杀。主端点组内每个端点采样 ≥2 次。
-        """
-        self.assertGreaterEqual(len(np.PROBE_ENDPOINTS), 2)
-        for item in np.PROBE_ENDPOINTS:
-            self.assertEqual(len(item), 4, f"端点定义应为四元组: {item}")
-            name, url, params, samples = item
-            self.assertIsInstance(name, str)
-            self.assertTrue(url.startswith("https://"))
-            self.assertIsInstance(params, dict)
-            self.assertGreaterEqual(int(samples), 1)
-        self.assertNotIn("82push2", [n for n, *_ in np.PROBE_ENDPOINTS])
-        samples = {n: s for n, _, _, s in np.PROBE_ENDPOINTS}
-        # 主端点组：至少两个 host，且每个都多次采样（单点单次采样会误杀路径）
-        self.assertGreaterEqual(len(np.PRIMARY_ENDPOINT_NAMES), 2)
-        for n in np.PRIMARY_ENDPOINT_NAMES:
-            self.assertIn(n, samples, f"主端点 {n} 必须在 PROBE_ENDPOINTS 中")
-            self.assertGreaterEqual(samples[n], 2, f"主端点 {n} 采样次数必须 ≥2")
-        # K线端点必须多次采样：直连下存在约 1/3 概率的间歇 RemoteDisconnected
-        self.assertGreaterEqual(samples["push2his"], 2)
-        # 辅助端点不得混进主端点组（否则降级惩罚失效）
-        self.assertTrue(all(n in samples for n in np.PRIMARY_ENDPOINT_NAMES))
+        self.assertEqual(got["degraded"], [names[1]])
+        self.assertGreater(got["score"], max(100.0, 120.0))  # 惩罚已计入
 
     # ---------- 排序与剔除 ----------
     def test_probe_paths_sorts_by_score(self):
@@ -202,6 +164,24 @@ class NetworkPathTests(unittest.TestCase):
             np.best_paths()
         self.assertEqual(pp.call_count, 2, "全失败时负缓存应更短")
 
+    def test_deadline_discards_late_probe_and_does_not_cache(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_probe(label, proxy):
+            started.set()
+            release.wait(timeout=2.0)
+            return _path(label, proxy, 10.0)
+
+        with patch.object(np, "candidate_paths", return_value=[("直连", None)]), \
+             patch.object(np, "_probe_one", side_effect=slow_probe):
+            paths = np.best_paths(deadline=time.monotonic() + 0.05)
+        self.assertEqual(paths, [])
+        self.assertIsNone(np._cached_paths)
+        release.set()
+        self.assertTrue(started.wait(timeout=0.2))
+        self.assertIsNone(np._cached_paths, "迟到探测结果不得回写全局缓存")
+
     def test_invalidate_forces_reprobe(self):
         with patch.object(np, "probe_paths", return_value=[_path("直连", None, 50.0)]) as pp:
             np.best_paths()
@@ -265,6 +245,34 @@ class NetworkPathTests(unittest.TestCase):
             np.ordered_sessions(sentinel)
         self.assertEqual(np._current_label, "代理A")
 
+    def test_independent_endpoint_can_try_candidates_after_eastmoney_negative_cache(self):
+        direct = object()
+        proxy_session = object()
+        candidates = [
+            ("直连", None),
+            ("代理127.0.0.1:7890", "http://127.0.0.1:7890"),
+        ]
+        with patch.object(np, "requests", object()), \
+             patch.object(np, "best_paths", return_value=[]), \
+             patch.object(np, "candidate_paths", return_value=candidates), \
+             patch.object(np, "_session_for", return_value=proxy_session):
+            got = np.ordered_independent_sessions(direct)
+
+        self.assertEqual(got, [("直连", direct), ("代理127.0.0.1:7890", proxy_session)])
+
+    def test_independent_endpoint_respects_route_cooldown(self):
+        direct = object()
+        proxy_session = object()
+        candidates = [("直连", None), ("代理A", "http://127.0.0.1:7890")]
+        with patch.object(np, "requests", object()), \
+             patch.object(np, "best_paths", return_value=[]), \
+             patch.object(np, "candidate_paths", return_value=candidates), \
+             patch.object(np, "_in_cooldown", side_effect=lambda label: label == "直连"), \
+             patch.object(np, "_session_for", return_value=proxy_session):
+            got = np.ordered_independent_sessions(direct)
+
+        self.assertEqual(got, [("代理A", proxy_session)])
+
     # ---------- 配置 ----------
     def test_load_candidate_ports_falls_back_on_missing_file(self):
         with patch.object(np, "_PORTS_CONFIG_PATH", np.Path("/nonexistent/proxy_ports.json")):
@@ -292,12 +300,24 @@ class NetworkPathTests(unittest.TestCase):
         finally:
             os.unlink(tmp)
 
-    def test_shipped_config_is_valid(self):
-        """自带配置必须可解析：允许空数组（= 明确禁用代理），但格式错误以外的值不得回落默认端口。
+    def test_explicit_empty_config_disables_local_proxy_ports(self):
+        """显式空数组 = 禁用全部本机候选代理端口，不得回落默认端口。
 
-        空数组是合法值——2026-09-21 起本机明确禁用全部候选代理端口（见 proxy_ports.json
-        的 _ports_note）：直连实测可用，而死端口/海外出口只会污染排序。
+        2026-09-21 本机事故：回落到 (7890, 7897) 后 7890 无监听、7897 出口为
+        日本东京，直接让引擎全程走海外出口、单轮跑满超时。空数组是合法配置值。
         """
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write('{"candidate_ports": []}')
+            tmp = f.name
+        try:
+            with patch.object(np, "_PORTS_CONFIG_PATH", np.Path(tmp)):
+                self.assertEqual(np.load_candidate_ports(), ())
+        finally:
+            os.unlink(tmp)
+
+    def test_shipped_config_is_valid(self):
+        """自带配置必须可解析：允许空数组（= 明确禁用代理），格式错误才回落默认值。"""
         raw = json.loads(np._PORTS_CONFIG_PATH.read_text(encoding="utf-8"))
         self.assertIn("candidate_ports", raw, "自带配置必须显式声明 candidate_ports")
         ports = np.load_candidate_ports()

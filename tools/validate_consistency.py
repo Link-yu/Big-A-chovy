@@ -24,6 +24,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+try:  # Windows 控制台默认 cp936：框架文本里的 ✓ 等字符会让 print 抛 UnicodeEncodeError
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+except Exception:
+    pass
+
 from tools.rule_config import (  # noqa: E402
     RULE_CONFIG,
     hhmm_to_minutes,
@@ -31,6 +37,7 @@ from tools.rule_config import (  # noqa: E402
     normalize_hhmm,
     shadow_targets,
 )
+from tools.validate_version import check_version_consistency  # noqa: E402
 
 
 def _issue(level: str, message: str) -> Dict[str, str]:
@@ -66,10 +73,12 @@ def check_config(config: Dict[str, Any] = RULE_CONFIG) -> Dict[str, List[Dict[st
         coalition = config["dominance"]["coalition"]
         execution = config["execution"]
         risk = config["risk"]
+        screening = config["screening"]
+        realtime = config["realtime"]
         shadow = config["shadow"]
         permissions = config["permissions"]
     except (KeyError, TypeError):
-        _add(result, "fail", "共享参数缺少 dominance/execution/risk/shadow/permissions 核心区段")
+        _add(result, "fail", "共享参数缺少 dominance/execution/risk/screening/realtime/shadow/permissions 核心区段")
         return result
 
     try:
@@ -150,6 +159,42 @@ def check_config(config: Dict[str, Any] = RULE_CONFIG) -> Dict[str, List[Dict[st
         _add(result, "pass", "公告风控状态、关键词、黑名单与低吸排除参数已集中登记")
     except (KeyError, TypeError, ValueError):
         _add(result, "fail", "风险策略参数类型或字段不完整")
+
+    try:
+        if not isinstance(screening, dict) or not isinstance(realtime, dict):
+            raise ValueError("screening/realtime must be objects")
+        required_screening = (
+            "low_absorb",
+            "breakout",
+            "sector_boost",
+            "flow",
+            "resonance",
+            "market_snapshot",
+            "strict_ultra",
+            "strict_trend",
+            "trend_observation",
+            "low_ultra",
+            "low_trend",
+            "low_open_wash",
+            "watchlist",
+            "capital_rank",
+        )
+        missing_screening = [key for key in required_screening if not isinstance(screening.get(key), dict)]
+        if missing_screening:
+            raise ValueError(f"missing screening sections: {','.join(missing_screening)}")
+        experimental = screening["low_absorb"]["experimental_retest_gate"]
+        if experimental.get("enabled") is not False or experimental.get("permission") != "simulated_only":
+            raise ValueError("experimental retest gate must remain disabled and simulated-only")
+        for key in ("market_thermometer", "cross_validation", "entry_exit"):
+            if not isinstance(realtime.get(key), dict):
+                raise ValueError(f"missing realtime section: {key}")
+        for section_name in ("strict_ultra", "strict_trend", "trend_observation", "low_ultra", "low_trend", "watchlist", "capital_rank"):
+            section = screening[section_name]
+            if not section or any(not _numeric(value) for value in section.values() if not isinstance(value, (dict, list))):
+                raise ValueError(f"{section_name} contains invalid numeric parameters")
+        _add(result, "pass", "筛选池、低吸评分、板块共振、资金排序与实时风控阈值已集中登记")
+    except (KeyError, TypeError, ValueError):
+        _add(result, "fail", "筛选或实时风控阈值区段类型、字段或实验权限不完整")
 
     if permissions.get("real_account_requires_complete_samples") is not True:
         _add(result, "fail", "真实仓权限门槛未设置为完整结算样本强制门禁")
@@ -233,57 +278,114 @@ def _progress_line(text: str, marker: str) -> Optional[str]:
     return None
 
 
+# 实验登记表的项目名（框架第六节）。用于核对“框架是否声明了目标与方法”。
+PROGRESS_MARKERS = {
+    "coalition": "⑥合力主升主导验证",
+    "breakout": "⑦观察池突破状态机",
+    "sector_boost": "⑧主线板块协同加分器",
+    "divergence": "⑨龙头分歧识别",
+}
+
+# 框架必须保留的两条声明：进度只在本地维护；达标前仅模拟。
+FRAMEWORK_PROGRESS_LOCAL_ONLY = "只在本地影子库维护"
+FRAMEWORK_SIMULATED_UNTIL_TARGET = "各自达到20个完整结算样本并完成转正评估前仅模拟运行"
+
+# 公开框架里**不得**出现的本地进度写法（出现即说明进度被写回了公开文档）。
+_FRAMEWORK_PROGRESS_LEAK = re.compile(r"已采集\s*\d+|完整结算\s*\d+\s*/\s*\d+")
+
+
 def check_framework_progress(
     project_root: Path = PROJECT_ROOT,
     db: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, List[Dict[str, str]]]:
-    """分别核对采集数和完整结算进度，未结算不得计入 x/20。"""
+    """核对框架的验证目标与权限声明，并把真实进度从本地影子库读出来。
+
+    进度数字**不进公开框架**：框架第六节明确“样本采集与结算进度、单笔案例及金额
+    只在本地影子库维护；公开框架只列验证目标和方法”。所以这里不再去解析框架里的
+    x/20（那既要求把私有进度公开，也会让框架与本地库各存一份互相漂移），而是分两步：
+
+    1. 框架侧：每类实验必须声明验证目标（``target_samples`` 个完整结算样本）与验证
+       方法，并保留「进度只在本地影子库维护」与「达标前仅模拟运行」两条声明；框架里
+       一旦出现 ``已采集 N`` / ``完整结算 N/M`` 这类进度写法即判 FAIL。
+    2. 影子库侧：按统一完整结算口径（:func:`is_complete_shadow_result`）算出实际进度
+       并通报，同时核对影子库的类别与目标值和共享配置一致。未结算样本不计入进度。
+    """
     result = _empty_result()
     framework = _read_text(project_root / "选股框架.md")
     if framework is None:
-        _add(result, "fail", "无法读取选股框架，不能对账影子进度")
-        return result
-    if db is None:
-        _add(result, "warn", "影子样本库不可用，跳过框架进度对账")
+        _add(result, "fail", "无法读取选股框架，不能核对验证目标与权限声明")
         return result
 
-    markers = {
-        "coalition": "⑥合力主升主导验证",
-        "breakout": "⑦观察池突破状态机",
-        "sector_boost": "⑧主线板块协同加分器",
-        "divergence": "⑨龙头分歧识别",
-    }
-    samples = db.get("samples") or {}
-    targets = db.get("targets") or {}
-    for category, marker in markers.items():
+    configured_target = int(RULE_CONFIG["shadow"]["target_samples"])
+
+    # ── 1. 框架侧：目标 + 方法 + 权限声明，且不得夹带本地进度 ──
+    for category, marker in PROGRESS_MARKERS.items():
         line = _progress_line(framework, marker)
         if line is None:
             _add(result, "fail", f"选股框架缺少待验证项：{category}")
             continue
-        configured_target = int(RULE_CONFIG["shadow"]["target_samples"])
-        match = re.search(r"完整结算\s*(\d+)\s*/\s*(\d+)", line)
-        collected = re.search(r"已采集\s*(\d+)", line)
-        if not match or not collected:
-            _add(result, "fail", f"选股框架必须分开标注 {category} 的已采集数与完整结算进度")
-            continue
-        reported_count, reported_target = int(match[1]), int(match[2])
-        rows = samples.get(category) or []
-        actual_count = sum(is_complete_shadow_result(row.get("t1_result")) for row in rows if isinstance(row, dict))
-        if int(collected[1]) != len(rows):
-            _add(result, "fail", f"{category} 采集数不一致：框架{collected[1]}，影子库{len(rows)}")
-        if reported_count != actual_count or reported_target != configured_target:
+        if f"{configured_target}个完整结算样本" not in line:
             _add(
                 result,
                 "fail",
-                f"{category} 进度不一致：框架 {reported_count}/{reported_target}，"
-                f"影子库 {actual_count}/{configured_target}",
+                f"{category} 未声明验证目标：应为「{configured_target}个完整结算样本」",
             )
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if len(cells) < 3 or not cells[2]:
+            _add(result, "fail", f"{category} 只登记了目标，缺少验证方法")
         else:
-            db_target = (targets.get(category) or {}).get("target_samples")
-            if db_target != configured_target:
-                _add(result, "fail", f"{category} 影子库目标值为 {db_target}，配置要求 {configured_target}")
-            else:
-                _add(result, "pass", f"{category} 完整结算进度一致：{actual_count}/{configured_target}，已采集{len(rows)}")
+            _add(result, "pass", f"{category} 已在框架登记验证目标与方法")
+
+    if FRAMEWORK_PROGRESS_LOCAL_ONLY not in framework:
+        _add(result, "fail", "选股框架未声明“进度只在本地影子库维护”，公开文档有变成进度台账的风险")
+    elif FRAMEWORK_SIMULATED_UNTIL_TARGET not in framework:
+        _add(result, "fail", "选股框架未声明实验达标前的权限规则（达标前仅模拟运行）")
+    else:
+        _add(result, "pass", "选股框架声明了本地维护进度与达标前仅模拟的权限规则")
+
+    leaked = sorted(set(_FRAMEWORK_PROGRESS_LEAK.findall(framework)))
+    if leaked:
+        _add(
+            result,
+            "fail",
+            "公开框架出现本地进度数字（应只存在于本地影子库）：" + "、".join(leaked),
+        )
+
+    # ── 2. 影子库侧：实际进度按统一完整结算口径读取，未结算不计入 ──
+    if db is None:
+        _add(result, "warn", "本地影子库不可用，只核对了框架声明，无法读取实际进度")
+        return result
+
+    samples = db.get("samples")
+    targets = db.get("targets")
+    if not isinstance(samples, dict) or not isinstance(targets, dict):
+        _add(result, "fail", "本地影子库 targets/samples 结构异常，不能核对进度")
+        return result
+    for category in PROGRESS_MARKERS:
+        rows = samples.get(category)
+        if not isinstance(rows, list):
+            _add(result, "fail", f"本地影子库缺少 {category} 的样本数组")
+            continue
+        db_target = (targets.get(category) or {}).get("target_samples")
+        if db_target != configured_target:
+            _add(
+                result,
+                "fail",
+                f"{category} 影子库目标值为 {db_target}，共享配置要求 {configured_target}",
+            )
+            continue
+        complete = sum(
+            1
+            for row in rows
+            if isinstance(row, dict) and is_complete_shadow_result(row.get("t1_result"))
+        )
+        _add(
+            result,
+            "pass",
+            f"{category} 实际进度（本地影子库）：完整结算 {complete}/{configured_target}；"
+            f"已采集 {len(rows)}（未结算不计入）",
+        )
     return result
 
 
@@ -306,24 +408,40 @@ def check_shadow_database(
         _add(result, "fail", "影子样本库顶层结构不是对象")
         return result
 
-    expected = set(shadow_targets())
-    actual_targets = set((db.get("targets") or {}).keys())
-    actual_samples = set((db.get("samples") or {}).keys())
-    if actual_targets != expected or actual_samples != expected:
+    configured_targets = shadow_targets()
+    expected = set(configured_targets)
+    targets = db.get("targets")
+    samples = db.get("samples")
+    if not isinstance(targets, dict) or not isinstance(samples, dict):
+        _add(result, "fail", "影子样本库 targets/samples 必须是对象")
+        return result
+    actual_targets = set(targets)
+    actual_samples = set(samples)
+    missing_targets = expected - actual_targets
+    missing_samples = expected - actual_samples
+    if missing_targets or missing_samples or actual_targets != actual_samples:
         _add(
             result,
             "fail",
-            f"影子机制类别不一致：配置={sorted(expected)}，"
+            f"影子机制类别缺失/错位：配置至少包含={sorted(expected)}，"
             f"targets={sorted(actual_targets)}，samples={sorted(actual_samples)}",
         )
         return result
 
-    for category, meta in shadow_targets().items():
-        target_meta = db["targets"].get(category) or {}
-        if target_meta.get("target_samples") != meta["target_samples"]:
+    for category in sorted(actual_targets):
+        target_meta = targets.get(category)
+        if not isinstance(target_meta, dict):
+            _add(result, "fail", f"{category} 数据库目标配置不是对象")
+            continue
+        configured = configured_targets.get(category)
+        target = target_meta.get("target_samples")
+        if isinstance(target, bool) or not isinstance(target, int) or target <= 0:
+            _add(result, "fail", f"{category} 数据库目标值不是正整数")
+            continue
+        if configured is not None and target != configured["target_samples"]:
             _add(result, "fail", f"{category} 数据库目标值与共享配置不一致")
             continue
-        rows = db["samples"].get(category)
+        rows = samples.get(category)
         if not isinstance(rows, list):
             _add(result, "fail", f"{category} 样本不是数组")
             continue
@@ -354,6 +472,7 @@ def check_code_wiring(project_root: Path = PROJECT_ROOT) -> Dict[str, List[Dict[
     result = _empty_result()
     paths = (
         project_root / "daily-stock-analysis" / "scripts" / "a_share_daily_screen.py",
+        project_root / "daily-stock-analysis" / "scripts" / "realtime_engine.py",
         project_root / "tools" / "scan_reports.py",
         project_root / "tools" / "verify_t1.py",
         project_root / "tools" / "shadow_tracker.py",
@@ -404,16 +523,24 @@ def check_code_wiring(project_root: Path = PROJECT_ROOT) -> Dict[str, List[Dict[
 def check_authority_boundaries(project_root: Path = PROJECT_ROOT) -> Dict[str, List[Dict[str, str]]]:
     """检查工具层没有重新建立第二套交易裁决规则。"""
     result = _empty_result()
-    skill = _read_text(project_root / "daily-stock-analysis" / "SKILL.md") or ""
-    trading_rules = _read_text(project_root / "daily-stock-analysis" / "references" / "trading-rules.md") or ""
-    if "不承担最终买卖" not in skill or "选股框架.md" not in skill:
-        _add(result, "fail", "daily-stock-analysis/SKILL.md 未明确筛选工具与交易裁决边界")
+    entry = _read_text(project_root / "AGENTS.md") or ""
+    required = (
+        "选股框架.md",
+        "交易规则唯一权威",
+        "skills/盘中/SKILL.md",
+        "项目唯一入口",
+        "daily-stock-analysis/",
+        "不做最终交易裁决",
+    )
+    missing = [item for item in required if item not in entry]
+    if missing:
+        _add(result, "fail", f"AGENTS.md 缺少权威边界声明：{'、'.join(missing)}")
     else:
-        _add(result, "pass", "筛选工具已声明由盘中 skill、框架和决策记录负责最终裁决")
-    if "不再维护第二套交易规则" not in trading_rules and "不承担最终买卖" not in trading_rules:
-        _add(result, "fail", "trading-rules.md 可能重新形成第二套交易规则")
+        _add(result, "pass", "统一入口已明确框架、项目盘中和筛选工具的权威边界")
+    if (project_root / "daily-stock-analysis" / "SKILL.md").exists():
+        _add(result, "fail", "筛选引擎重新出现独立 SKILL.md，应仅保留项目盘中入口")
     else:
-        _add(result, "pass", "辅助 trading-rules 文档未建立第二套交易裁决规则")
+        _add(result, "pass", "筛选引擎未另设独立 AI Skill 入口")
     return result
 
 
@@ -448,6 +575,7 @@ def validate_workspace(project_root: Path = PROJECT_ROOT) -> Dict[str, List[Dict
         check_code_wiring(project_root),
         check_authority_boundaries(project_root),
         check_active_skill(project_root),
+        check_version_consistency(project_root),
     ):
         _merge(result, check)
     return result

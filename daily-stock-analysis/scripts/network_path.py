@@ -31,7 +31,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import ssl
 import subprocess
 import sys
 import threading
@@ -42,6 +41,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
+import tls_context  # 同目录：TLS 校验上下文唯一来源
+
 try:
     import requests
     requests.packages.urllib3.disable_warnings()
@@ -49,59 +50,31 @@ except Exception:  # 引擎在无 requests 环境走 urllib 兜底，本模块�
     requests = None
 
 # ---- 配置 ----
-# 健康检查端点。第一个为主端点：必须通，该路径才算可用；
-# 其余为辅助端点：不通只记降级 + 排序惩罚（不同域名可能表现不同）。
-#
-# 字段含义：(名称, URL, 参数, 采样次数)。采样次数 >1 表示该端点存在间歇性失败，
-# 需要多次尝试、取「最快成功值」，否则会把可用路径误判为降级。
-#
-# 2026-09-21 重构（关键）：
-#   原先第三个端点是 82.push2（当时被当作"资金流专用域名"）。实测该域名在**所有**出口
-#   都返回 RemoteDisconnected（直连 / 国内代理 / 海外代理一致），已彻底失效；而引擎的资金流
-#   字段（f62/f184）本来就取自 push2delay 的 clist 接口，并不依赖它。一个全员失败的端点
-#   等于给每条路径加同一个惩罚，反而把真正有区分度的 push2his 信息稀释掉——
-#   这正是境外出口节点被误选为"最快路径"的直接原因。
-#   现改为只保留两个真实业务端点，且 push2his 采样 3 次（直连约 1/3 概率间歇断连）。
-#
-# 2026-09-23 修复（关键，实测驱动）：
-#   现象：看板全天刷 "no working network path; preserving last snapshot"（快照停在 13:13:21），
-#         而同一时段引擎自己却成功拿到全量 56 页 5561 行 —— 因为引擎的东财端点表有 5 个 host
-#         依次回退（见 a_share_daily_screen.py 的 EM_*_URLS），push2delay 挂了它照样取到数。
-#   根因：探测此前只有 push2delay 一个主端点、且采样次数为 1。实测该端点直连成功率仅约 1/3
-#         （`_probe_all(None)` 直连 6 连测：4 次 None / 2 次可用），单次采样 ⇒ 约 2/3 概率把
-#         整条路径判死 ⇒ has_working_path() 返回 False ⇒ 看板在启动引擎**之前**就跳过本轮。
-#         即「探测口径」与「取数口径」不一致（两张皮）。
-#   修复：① 主端点扩为「push2 系任一端点可达即算通」，与引擎的多 host 回退口径对齐；
-#         ② 主端点采样 3 次（2026-09-23 二次实测：看板进程视角下 5 轮 warm_up 仅 2 轮判可用，
-#            单次探测命中率约 40%~50%；失败是「快速失败」约 0.3~0.8s 即返回，加采样成本很低）；
-#         ③ K线端点保持 3 次。
-PRIMARY_ENDPOINT_NAMES: Tuple[str, ...] = ("push2delay", "push2")
-PROBE_ENDPOINTS: Tuple[Tuple[str, str, Dict[str, Any], int], ...] = (
-    ("push2delay", "https://push2delay.eastmoney.com/api/qt/clist/get",
-     {"pn": 1, "pz": 1, "fs": "m:1+t:2", "fields": "f12,f14"}, 3),
-    ("push2", "https://push2.eastmoney.com/api/qt/clist/get",
-     {"pn": 1, "pz": 1, "fs": "m:1+t:2", "fields": "f12,f14"}, 3),
-    ("push2his", "https://push2his.eastmoney.com/api/qt/stock/kline/get",
-     {"secid": "1.600000", "klt": "101", "fqt": "1", "lmt": "1",
-      "fields1": "f1", "fields2": "f51"}, 3),
+# 健康检查端点。首个端点是筛选器实际使用的 webguest 主入口，必须通；
+# 其余为辅助端点，不通只记降级 + 排序惩罚。
+PROBE_ENDPOINTS: Tuple[Tuple[str, str, Dict[str, Any]], ...] = (
+    ("webguest", "https://push2.eastmoney.com/webguest/api/qt/clist/get",
+     {"pn": 1, "pz": 1, "fs": "m:1+t:2", "fields": "f12,f14"}),
+    ("webguest82", "https://82.push2.eastmoney.com/webguest/api/qt/clist/get",
+     {"pn": 1, "pz": 1, "fs": "m:0+t:6", "fields": "f12,f14"}),
+    # 2026-09-26: 第三个探测点改为引擎实际使用的资金流兜底路径（同主机、不同路径）。
+    # 2026-09-25 实测同一 IP 上 clist 与 fflow 的生死可能不一致，只测 clist 覆盖不到；
+    # 原 push2his 端点已随该主机全面不可用而废弃（push2his 无 /webguest，标准路由已下线）。
+    ("fflow", "https://push2.eastmoney.com/webguest/api/qt/stock/fflow/kline/get",
+     {"secid": "1.600000", "klt": "1", "lmt": "2",
+      "fields1": "f1,f2,f3,f7", "fields2": "f51,f52"}),
 )
 PROBE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) daily-stock-analysis/1.0",
     "Referer": "https://quote.eastmoney.com/center/gridlist.html",
     "Accept": "application/json,text/plain,*/*",
 }
-PROBE_TIMEOUT = 2.5        # 单端点单次探测超时（秒）。本机实测成功响应 430~900ms；
-                           # 失败多为「快速失败」（约 0.3~0.8s 即 RemoteDisconnected），
-                           # 故调低超时 + 加采样次数，用「多试几次」换稳定性，成本更低。
+PROBE_TIMEOUT = 3.0        # 单端点探测超时（秒）
 CACHE_TTL = 300.0          # 成功结果的缓存时长（秒）
 NEGATIVE_TTL = 30.0        # 全部失败的负缓存时长（秒），避免网络断开时每次请求都探测
 SLOW_PATH_MS = 2000.0      # 超过此延迟视为「太慢」，有替代路径时不用它
 STICKY_MARGIN_MS = 50.0    # 当前路径比最快路径慢不超过这个值就不切换（防抖动）
-# 每个不通的辅助端点的排序惩罚。原值 1000 偏低：一个端点不通意味着批量阶段每只标的
-# 都要先在这条路径上失败一次才切换，实际损失远超 1s，导致「延迟低但端点残缺」的路径
-# 反而胜出（2026-09-21 实测境外代理 35ms 排到直连 789ms 之前）。提高到 3000 确保
-# 「端点全通」优先于「单纯延迟低」；所有路径都残缺时惩罚相同，仍按延迟排序。
-DEGRADE_PENALTY_MS = 3000.0
+DEGRADE_PENALTY_MS = 1000.0  # 每个不通的辅助端点的排序惩罚
 FAIL_STREAK_LIMIT = 3      # 连续失败几次后进入冷却
 COOLDOWN_SEC = 60.0        # 冷却时长（秒），期间不再探测该路径
 
@@ -115,10 +88,11 @@ def load_candidate_ports() -> Tuple[int, ...]:
 
     注意：keep_proxy_alive.sh 读的是同一个文件，换代理软件改一处即可。
 
-    2026-09-21 修正：显式写 "candidate_ports": [] 表示「禁用所有本机代理端口」，
-    此时返回空元组。原实现把空数组也当成"读不到配置"而回落到 DEFAULT_LOCAL_PROXY_PORTS，
-    于是"禁用代理"的意图被静默翻译成"启用 7890/7897"——正是这两个端口把日本出口节点
-    送进候选、在排序中压过直连、导致引擎整轮超时。
+    2026-09-21 修正（同步 v0.7.1 时保留）：显式写 "candidate_ports": [] 表示
+    「禁用所有本机代理端口」，此时返回空元组。上游实现把空数组也当成"读不到配置"
+    而回落到 DEFAULT_LOCAL_PROXY_PORTS=(7890, 7897)，于是「禁用代理」的意图被静默
+    翻译成「启用 7890/7897」——7890 在本机无监听、7897 出口是日本东京，实测会让
+    引擎全程走海外出口、单轮跑满超时、看板退化为重放旧快照。
     """
     try:
         if _PORTS_CONFIG_PATH.exists():
@@ -137,6 +111,8 @@ _lock = threading.Lock()
 _cached_paths: Optional[List[Dict[str, Any]]] = None   # 排好序的可用路径
 _cached_at: float = 0.0
 _cached_ok: bool = False
+_independent_candidates: Optional[List[Tuple[str, Optional[str]]]] = None
+_independent_candidates_at: float = 0.0
 _proxy_sessions: Dict[str, Any] = {}                   # proxy_url -> requests.Session
 _current_label: Optional[str] = None                   # 当前选中路径，用于切换粘性
 _fail_streak: Dict[str, int] = {}                      # label -> 连续失败次数
@@ -144,12 +120,17 @@ _cooldown_until: Dict[str, float] = {}                 # label -> 冷却截止�
 _last_switch_reason: str = ""                          # 最近一次切换原因（诊断用）
 
 
-def _scutil_proxy_url() -> str:
+def _scutil_proxy_url(*, deadline: float | None = None) -> str:
     """读 macOS 系统代理（仅作为候选，读不到/非 darwin 一律返回空）。"""
     if sys.platform != "darwin":
         return ""
     try:
-        out = subprocess.run(["scutil", "--proxy"], capture_output=True, text=True, timeout=5)
+        timeout = 5.0
+        if deadline is not None:
+            timeout = min(timeout, deadline - time.monotonic())
+            if timeout <= 0:
+                return ""
+        out = subprocess.run(["scutil", "--proxy"], capture_output=True, text=True, timeout=timeout)
         if out.returncode == 0:
             m = re.search(r"HTTPSProxy\s*:\s*([\d.]+)", out.stdout or "")
             pm = re.search(r"HTTPSPort\s*:\s*(\d+)", out.stdout or "")
@@ -160,7 +141,7 @@ def _scutil_proxy_url() -> str:
     return ""
 
 
-def candidate_paths() -> List[Tuple[str, Optional[str]]]:
+def candidate_paths(*, deadline: float | None = None) -> List[Tuple[str, Optional[str]]]:
     """枚举候选路径 [(label, proxy_url|None)]，proxy_url=None 表示直连。"""
     paths: List[Tuple[str, Optional[str]]] = [("直连", None)]
     seen: set[str] = set()
@@ -183,7 +164,7 @@ def candidate_paths() -> List[Tuple[str, Optional[str]]]:
     env_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
     if env_proxy:
         _add(env_proxy)
-    _add(_scutil_proxy_url())
+    _add(_scutil_proxy_url(deadline=deadline))
     return paths
 
 
@@ -205,69 +186,56 @@ def _session_for(proxy_url: Optional[str]):
 
 
 def _is_em_json(data: Any) -> bool:
-    # clist/get 合法返回形如 {"rc":0,...,"data":{...}}；本地端口误答 200 时会在这里被拒
-    return isinstance(data, dict) and ("rc" in data or "data" in data)
+    # Reject HTTP-200 error bodies; a healthy Eastmoney response has rc=0 and data.
+    if not isinstance(data, dict) or data.get("rc", 0) not in (0, "0"):
+        return False
+    return isinstance(data.get("data"), dict)
 
 
 def _probe_requests(proxy_url: Optional[str]) -> Dict[str, Optional[float]]:
-    """用 requests 依次探测各端点，返回 {端点名: 延迟ms 或 None}。
-
-    采样次数 >1 的端点：只要有一次成功即算通，取最快成功值并提前收敛。
-    避免「单次间歇失败 → 可用路径被判降级 → 排序输给本来更差的路径」。
-    """
+    """用 requests 依次探测各端点，返回 {端点名: 延迟ms 或 None}。"""
     result: Dict[str, Optional[float]] = {}
     session = _session_for(proxy_url)
     if session is None:
-        return {name: None for name, *_ in PROBE_ENDPOINTS}
-    for name, url, params, samples in PROBE_ENDPOINTS:
-        best: Optional[float] = None
-        for _ in range(max(1, samples)):
-            try:
-                t0 = time.perf_counter()
-                resp = session.get(url, params=params, headers=PROBE_HEADERS,
-                                   timeout=PROBE_TIMEOUT, verify=False)
-                resp.raise_for_status()
-                data = resp.json()
-                latency = (time.perf_counter() - t0) * 1000.0
-                if _is_em_json(data):
-                    cand = round(latency, 1)
-                    best = cand if best is None else min(best, cand)
-                    break  # 已确认可达，无需继续采样
-            except Exception:
-                continue
-        result[name] = best
+        return {name: None for name, _, _ in PROBE_ENDPOINTS}
+    for name, url, params in PROBE_ENDPOINTS:
+        try:
+            t0 = time.perf_counter()
+            resp = session.get(url, params=params, headers=PROBE_HEADERS,
+                               timeout=PROBE_TIMEOUT, verify=tls_context.requests_verify())
+            resp.raise_for_status()
+            data = resp.json()
+            latency = (time.perf_counter() - t0) * 1000.0
+            result[name] = round(latency, 1) if _is_em_json(data) else None
+        except Exception:
+            result[name] = None
     return result
 
 
 def _probe_urllib(proxy_url: Optional[str]) -> Dict[str, Optional[float]]:
     """无 requests 环境用标准库探测（与引擎 urllib 兜底同一传输方式）。"""
     result: Dict[str, Optional[float]] = {}
-    ssl_ctx = ssl._create_unverified_context()
-    for name, url, params, samples in PROBE_ENDPOINTS:
-        best: Optional[float] = None
-        for _ in range(max(1, samples)):
-            try:
-                handlers = [urllib.request.HTTPSHandler(context=ssl_ctx)]
-                if proxy_url:
-                    handlers.append(urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
-                else:
-                    handlers.append(urllib.request.ProxyHandler({}))
-                opener = urllib.request.build_opener(*handlers)
-                req = urllib.request.Request(f"{url}?{urllib.parse.urlencode(params)}",
-                                             headers=PROBE_HEADERS)
-                t0 = time.perf_counter()
-                with opener.open(req, timeout=PROBE_TIMEOUT) as resp:
-                    if resp.status != 200:
-                        continue
-                    data = json.loads(resp.read().decode("utf-8", "replace"))
-                latency = (time.perf_counter() - t0) * 1000.0
-                if _is_em_json(data):
-                    cand = round(latency, 1)
-                    best = cand if best is None else min(best, cand)
-                    break
-            except Exception:
-                continue
-        result[name] = best
+    ssl_ctx = tls_context.build_context()
+    for name, url, params in PROBE_ENDPOINTS:
+        try:
+            handlers = [urllib.request.HTTPSHandler(context=ssl_ctx)]
+            if proxy_url:
+                handlers.append(urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
+            else:
+                handlers.append(urllib.request.ProxyHandler({}))
+            opener = urllib.request.build_opener(*handlers)
+            req = urllib.request.Request(f"{url}?{urllib.parse.urlencode(params)}",
+                                         headers=PROBE_HEADERS)
+            t0 = time.perf_counter()
+            with opener.open(req, timeout=PROBE_TIMEOUT) as resp:
+                if resp.status != 200:
+                    result[name] = None
+                    continue
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+            latency = (time.perf_counter() - t0) * 1000.0
+            result[name] = round(latency, 1) if _is_em_json(data) else None
+        except Exception:
+            result[name] = None
     return result
 
 
@@ -278,37 +246,23 @@ def _probe_all(proxy_url: Optional[str]) -> Dict[str, Optional[float]]:
     return _probe_urllib(proxy_url)
 
 
-def _primary_reachable(raw: Dict[str, Optional[float]]) -> bool:
-    """主端点组内任一端点可达，即认为这条路径能拿到行情。
-
-    必须用「组」而不是单点判定：引擎在 push2delay 失败时会自动回退
-    push2 / 82.push2 / 72.push2 / 83.push2（见 a_share_daily_screen.py 的 EM_*_URLS），
-    因此只认单一 push2delay 会把「引擎明明取得到数」的路径判死——
-    这正是 2026-09-23 看板全天误报「数据源降级」的根因。
-    """
-    return any(raw.get(name) is not None for name in PRIMARY_ENDPOINT_NAMES)
-
-
 def _probe_one(label: str, proxy_url: Optional[str]) -> Optional[Dict[str, Any]]:
-    """实测单条路径；主端点组全不通返回 None，否则返回带降级信息的路径描述。"""
+    """实测单条路径；主端点不通返回 None，否则返回带降级信息的路径描述。"""
     raw = _probe_all(proxy_url)
-    if not _primary_reachable(raw):
-        return None  # 主端点组全不通 → 这条路径不可用
-    degraded = [name for name, *_ in PROBE_ENDPOINTS
-                if name not in PRIMARY_ENDPOINT_NAMES and raw.get(name) is None]
+    primary_name = PROBE_ENDPOINTS[0][0]
+    primary = raw.get(primary_name)
+    if primary is None:
+        return None  # 主端点不通 → 这条路径不可用
+    degraded = [name for name, _, _ in PROBE_ENDPOINTS[1:] if raw.get(name) is None]
     # 综合延迟：各端点实测值的最大值（保守），再加降级惩罚
     observed = [v for v in raw.values() if v is not None]
     score = max(observed) + DEGRADE_PENALTY_MS * len(degraded)
-    # 展示用延迟取主端点组里最快的一次实测（组内可能有端点不通，需过滤 None）
-    primary_latency = min(
-        v for v in (raw.get(n) for n in PRIMARY_ENDPOINT_NAMES) if v is not None
-    )
     return {
         "label": label,
         "proxy": proxy_url,
-        "latency_ms": round(primary_latency, 1),   # 主端点实测延迟（展示用）
-        "score": round(score, 1),                  # 排序用（含降级惩罚）
-        "degraded": degraded,                      # 不通的辅助端点
+        "latency_ms": round(primary, 1),      # 主端点实测延迟（展示用）
+        "score": round(score, 1),             # 排序用（含降级惩罚）
+        "degraded": degraded,                 # 不通的辅助端点
         "endpoints": raw,
     }
 
@@ -331,26 +285,51 @@ def record_success(label: str) -> None:
         _cooldown_until.pop(label, None)
 
 
-def probe_paths() -> List[Dict[str, Any]]:
-    """并发探测所有候选路径，返回按 score 升序的可用路径列表（不读缓存）。"""
-    from concurrent.futures import ThreadPoolExecutor
+def probe_paths(*, deadline: float | None = None) -> List[Dict[str, Any]]:
+    """并发探测候选路径，并在 deadline 前返回。
 
-    candidates = candidate_paths()
+    探测线程必须是 daemon 线程。  ``ThreadPoolExecutor`` 的 worker 会被
+    ``concurrent.futures`` 的解释器退出钩子再次等待，即使调用方已经超时
+    返回，冷启动子进程仍可能被慢探测拖住。这里让探测结果只写入本轮的
+    局部数组；超时后的迟到结果既不返回，也不进入全局缓存。
+    """
+    if deadline is not None and time.monotonic() >= deadline:
+        return []
+    candidates = candidate_paths(deadline=deadline)
+    if deadline is not None and time.monotonic() >= deadline:
+        return []
     # 冷却中的路径先跳过；若全部在冷却则本轮全部放行，避免无路可走
     active = [c for c in candidates if not _in_cooldown(c[0])] or candidates
     results: List[Optional[Dict[str, Any]]] = [None] * len(active)
 
-    with ThreadPoolExecutor(max_workers=max(2, len(active))) as pool:
-        futs = [pool.submit(_probe_one, label, proxy) for label, proxy in active]
-        # 池超时按「端点最坏耗时之和」估算：端点间串行，单端点最坏 = 采样次数 × PROBE_TIMEOUT。
-        # 原公式 (PROBE_TIMEOUT+1.0) * 端点个数 漏算了采样次数——加端点/加采样后，
-        # 全超时的最坏情况会超过池超时，把正在探测的可用路径直接吞成 None（2026-09-23 修正）。
-        budget = PROBE_TIMEOUT * sum(s for *_, s in PROBE_ENDPOINTS) + 2.0
-        for i, fut in enumerate(futs):
-            try:
-                results[i] = fut.result(timeout=budget)
-            except Exception:
-                results[i] = None
+    def run_one(index: int, label: str, proxy: Optional[str]) -> None:
+        try:
+            results[index] = _probe_one(label, proxy)
+        except Exception:
+            results[index] = None
+
+    threads: list[threading.Thread] = []
+    for index, (label, proxy) in enumerate(active):
+        thread = threading.Thread(
+            target=run_one,
+            args=(index, label, proxy),
+            name=f"a-share-network-probe-{index}",
+            daemon=True,
+        )
+        threads.append(thread)
+        thread.start()
+
+    # Without an explicit caller budget, bound a probe round by the existing
+    # per-endpoint timeout plus a small scheduling allowance.  With a caller
+    # budget, no join may cross it.
+    wait_until = deadline if deadline is not None else time.monotonic() + (PROBE_TIMEOUT + 1.0) * max(1, len(PROBE_ENDPOINTS))
+    for thread in threads:
+        remaining = wait_until - time.monotonic()
+        if remaining <= 0:
+            break
+        thread.join(timeout=remaining)
+    if deadline is not None and time.monotonic() >= deadline:
+        return []
     paths = [r for r in results if r is not None]
     if not paths:
         return []
@@ -381,16 +360,20 @@ def _apply_sticky(paths: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return paths
 
 
-def best_paths(max_age: float = CACHE_TTL) -> List[Dict[str, Any]]:
+def best_paths(max_age: float = CACHE_TTL, *, deadline: float | None = None) -> List[Dict[str, Any]]:
     """带缓存的可用路径列表（按实测延迟升序，最快在前）。"""
     global _cached_paths, _cached_at, _cached_ok
+    if deadline is not None and time.monotonic() >= deadline:
+        return []
     with _lock:
         now = time.time()
         if _cached_paths is not None:
             ttl = CACHE_TTL if _cached_ok else NEGATIVE_TTL
             if now - _cached_at <= ttl:
                 return list(_cached_paths)
-    paths = probe_paths()
+    paths = probe_paths(deadline=deadline)
+    if deadline is not None and time.monotonic() >= deadline:
+        return []
     with _lock:
         _cached_paths = paths
         _cached_ok = bool(paths)
@@ -430,13 +413,61 @@ def ordered_sessions(direct_session) -> List[Tuple[str, Any]]:
     return sessions
 
 
-def best_proxy_url() -> Optional[str]:
+def independent_path_candidates(*, deadline: float | None = None) -> List[Tuple[str, Optional[str]]]:
+    """Return measured routes, or all non-cooled candidates for an independent host.
+
+    The cached Eastmoney probe can legitimately have no winning path while a
+    different provider (for example Sina) remains reachable through one of
+    those same routes. Keep normal latency/sticky ordering when Eastmoney has
+    winners; only bypass that endpoint-specific negative result, while still
+    respecting the existing candidate list and circuit cooldowns.
+    """
+    paths = best_paths(deadline=deadline)
+    if paths:
+        candidates = [(path["label"], path["proxy"]) for path in paths]
+    else:
+        global _independent_candidates, _independent_candidates_at
+        with _lock:
+            cached = _independent_candidates
+            cache_fresh = cached is not None and time.time() - _independent_candidates_at <= NEGATIVE_TTL
+        if cache_fresh:
+            candidates = list(cached or [])
+        else:
+            candidates = candidate_paths(deadline=deadline)
+            if deadline is None or time.monotonic() < deadline:
+                with _lock:
+                    _independent_candidates = list(candidates)
+                    _independent_candidates_at = time.time()
+        active = [entry for entry in candidates if not _in_cooldown(entry[0])]
+        candidates = active or candidates
+        if _current_label:
+            current = next((entry for entry in candidates if entry[0] == _current_label), None)
+            if current is not None:
+                candidates = [current] + [entry for entry in candidates if entry is not current]
+    return candidates
+
+
+def ordered_independent_sessions(
+    direct_session, *, deadline: float | None = None
+) -> List[Tuple[str, Any]]:
+    """Build reusable sessions for the routes available to an independent host."""
+    if requests is None:
+        return []
+    candidates = independent_path_candidates(deadline=deadline)
+    sessions = [
+        (label, direct_session if proxy is None else _session_for(proxy))
+        for label, proxy in candidates
+    ]
+    return sessions
+
+
+def best_proxy_url(*, deadline: float | None = None) -> Optional[str]:
     """实测最优路径的代理 URL；最优是直连（或全不通）时返回 None。
 
     注意：必须取排序后的第一条判断。原实现遍历找「第一个代理」，
     会导致直连明明更快时仍返回某个代理，看板因此永远走代理。
     """
-    paths = best_paths()
+    paths = best_paths(deadline=deadline)
     if not paths:
         return None
     return paths[0]["proxy"]  # 直连时 proxy 为 None
@@ -459,8 +490,7 @@ def diagnostics() -> Dict[str, Any]:
             "ports_config": str(_PORTS_CONFIG_PATH),
             "ports_config_exists": _PORTS_CONFIG_PATH.exists(),
             "candidate_ports": list(LOCAL_PROXY_PORTS),
-            "probe_endpoints": [name for name, *_ in PROBE_ENDPOINTS],
-            "primary_endpoints": list(PRIMARY_ENDPOINT_NAMES),
+            "probe_endpoints": [name for name, _, _ in PROBE_ENDPOINTS],
             "current_label": _current_label,
             "last_switch_reason": _last_switch_reason,
             "fail_streak": dict(_fail_streak),
@@ -472,8 +502,7 @@ def diagnostics() -> Dict[str, Any]:
 
 def _main() -> int:
     paths = probe_paths()
-    print(f"探测端点: {', '.join(name for name, *_ in PROBE_ENDPOINTS)}"
-          f"（主端点组 {'/'.join(PRIMARY_ENDPOINT_NAMES)} 任一端可达即算通）")
+    print(f"探测端点: {', '.join(name for name, _, _ in PROBE_ENDPOINTS)}（第一个为主端点，必须通）")
     print(f"候选端口: {list(LOCAL_PROXY_PORTS)}  (来源: {_PORTS_CONFIG_PATH.name}"
           f"{'' if _PORTS_CONFIG_PATH.exists() else '，文件不存在用默认值'})")
     if not paths:

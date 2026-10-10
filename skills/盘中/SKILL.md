@@ -20,6 +20,8 @@ description: 在本股票工作区读取筛选报告、盘问候选与持仓、�
 1. 从最新决策记录恢复三类持仓、现金、在盯和T+1可卖状态；可用 `python3 tools/get_position.py --json`。
 2. 先核对已有在盯与持仓的状态变化，再扫描新候选；覆盖报告所有候选池及明日观察池。
 3. 按框架核验信号、正式/实验权限、公告、资金连续性、主导、板块、买点、分笔五档、盈利状态与YTD。用项目行情和基本面工具补证据，缺数据如实列卡点。
+   - 分笔可用 `python3 tools/query_ticks.py <代码> --json` 按需核验 5/15 分钟 B/S/M；基本面用 `python3 tools/query_financials.py <代码> --json`，以已披露利润表为盈利证据，动态/TTM PE 只作估值快照。
+   - 需要隔夜背景时再查 `query_events.py`、`query_sentiment.py`、`query_context.py` 和 `query_calendar.py`；这些返回统一状态与时点，`empty` 不等于源失败，`unavailable/partial/unknown` 不得写成“没有利空”。它们不改变框架阈值、评分、状态机或真实仓权限。
 4. 按框架四层裁决。真实仓建议逐只展示七项支撑及T+1计划；模拟实验注明类别和权限；仅影子采样的信号不改写成可买。
 5. 按CLAUDE.md日志格式落盘本次范围、结论、在盯变化与计划。建议挂单与实际成交分开记录，不自动下单。
 
@@ -34,3 +36,5 @@ description: 在本股票工作区读取筛选报告、盘问候选与持仓、�
 普通输出遵循 [ggp显示约定](../../docs/ggp_display_prompt.md)；仅机器通道读取 [ggp协议](../../docs/ggp_prompt.md)。工具命令与网络代理用法见README和CLAUDE.md。
 
 所有报告、决策记录、持仓、影子样本与账户资料只留本地，不提交GitHub或发送外部服务。
+
+历史研究只能作为离线证据：`tools/query_history.py` 的日线包、可选历史估值/ST/停牌与申万行业变迁，以及 `tools/query_chips.py` 的“筹码估算”不能还原盘中分笔、五档、资金 5/15 分钟或交集样本，也不能替代建仓前实时核验。缺失数据按未知处理，不为方便裁决而补零或猜测。

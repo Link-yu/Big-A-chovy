@@ -14,7 +14,7 @@
 2) 触发结果只进模拟仓影子采样（shadow_samples.json 的 divergence 类），
    在攒满 20 个完整结算样本前，不得据此给真实仓建议；
 3) 不改写现行"超大单为负一票否决"的正式判定（scan_reports.py 不动）；
-4) 公告 avoid 仍是一票否决，本通道不可绕过。
+4) 公告 avoid/unknown 与高位派发否决仍是一票否决，本通道不可豁免。
 
 判定条件（初值，影子期校准；全部基于报告已有字段）：
   结构三条件（须同时成立）：
@@ -26,7 +26,7 @@
     A 否决旁路：超大单 < 0（分歧抛压被承接）；
     B 比值不足：生产主导标签为明确 "✗"（✓/✓(绝对)/✓(合力) 均视为已具正式主导，
       不进入旁路）且 超单/主力净额 < 20%。
-  同股同日只记首个触发快照；当日任一快照出现 avoid 即整股隔离。
+  同股同日只记首个触发快照；当日任一快照出现 avoid/unknown 或派发否决即整股隔离。
 """
 
 import argparse
@@ -42,12 +42,15 @@ for p in (str(PROJECT_ROOT), str(PROJECT_ROOT / "tools")):
         sys.path.insert(0, p)
 
 from tools.report_parser import parse_screening_report  # noqa: E402
-from tools.shadow_tracker import init_db, save_db, SHADOW_DB_FILE  # noqa: E402
+from tools.shadow_tracker import mutate_db, SHADOW_DB_FILE  # noqa: E402
 from tools.rule_config import RULE_CONFIG  # noqa: E402
 
 # ---- 参数区（初值·影子期校准；改动需留痕）----
 DIVERGENCE_CONFIG = RULE_CONFIG["divergence"]
 RISK_AVOID = RULE_CONFIG["risk"]["statuses"]["avoid"]
+RISK_UNKNOWN = RULE_CONFIG["risk"]["statuses"]["unknown"]
+# 高位破位派发一票否决：低吸表「资金状态」出现"疑似派发"即整股隔离。
+DISTRIBUTION_TAG = "派发"
 D1_MIN_MAINP = DIVERGENCE_CONFIG["min_main_pct_exclusive"]  # S1: 主力净占比下限
 D1_LOOKBACK = DIVERGENCE_CONFIG["lookback_snapshots"]        # S1: 回看快照数
 D1_RISE = DIVERGENCE_CONFIG["min_rise_pct"]                  # S1: 最小升幅（pct 点）
@@ -82,17 +85,40 @@ def fnum(s, default=None):
 
 
 def day_files(date_str):
-    d = REPORTS_ROOT / date_str
-    return sorted(glob.glob(str(d / f"A股筛选结果_{date_str}_*.md")))
+    """当日全部报告文件：日期目录 + 根目录（尚未归档），按时间升序并去重。
+
+    当日报告先平铺在 筛选结果/ 根目录，收盘后才归档进 筛选结果/YYYYMMDD/。
+    只读日期目录会在盘中漏判，因此两个位置都要发现；按文件名（含 HHMM）
+    去重后排序，归档中途重复扫描同一份报告也只算一次。
+    """
+    seen: dict[str, str] = {}
+    for pattern in (
+        REPORTS_ROOT / date_str / f"A股筛选结果_{date_str}_*.md",
+        REPORTS_ROOT / f"A股筛选结果_{date_str}_*.md",
+    ):
+        for fp in glob.glob(str(pattern)):
+            seen.setdefault(os.path.basename(fp), fp)
+    return [seen[name] for name in sorted(seen)]
+
+
+def has_veto_snapshot(snap) -> bool:
+    """公告 avoid/unknown 与高位派发否决：任一快照出现即整股隔离。
+
+    框架“一票否决”含公告 avoid/unknown 与高位破位派发；本通道不得豁免。
+    """
+    ann = str(snap.get("ann") or "")
+    if RISK_AVOID in ann or RISK_UNKNOWN in ann:
+        return True
+    return DISTRIBUTION_TAG in str(snap.get("flow_status") or "")
 
 
 def evaluate_history(code, name, plate, snaps, date_str):
     """纯函数：对单只股票的当日快照序列做分歧判定，返回触发dict或None。
 
     snaps 须按时间升序；每个元素至少含：
-    time, price, pull, vwap_up, mainp, xl, dom, amt, reso, n_sec, ann, report_file
+    time, price, pull, vwap_up, mainp, xl, dom, amt, reso, n_sec, ann, flow_status, report_file
     """
-    if any(RISK_AVOID in (s.get("ann") or "") for s in snaps):
+    if any(has_veto_snapshot(s) for s in snaps):
         return None
     seen_mainp = []
     for i, s in enumerate(snaps):
@@ -164,6 +190,7 @@ def group_histories(files):
                 reso=r.get("共振") == "是",
                 n_sec=fnum(r.get("板块内候选"), 0),
                 ann=r.get("公告风险", ""),
+                flow_status=r.get("资金状态", ""),
                 report_file=fname,
             ))
     return history, names, plates
@@ -198,37 +225,80 @@ def detect_day(date_str, verbose=True):
     return triggers
 
 
+# 只读徽标状态：供看板展示“符合影子采样条件/未完成判定”，不写入影子库。
+BADGE_TRIGGERED = "triggered"
+BADGE_NOT_TRIGGERED = "not_triggered"
+BADGE_UNDETERMINED = "undetermined"
+
+
+def evaluate_day_badges(date_str):
+    """只读判定：返回 {code: badge} 供页面展示，不写影子库。
+
+    badge = {status, trigger_time?, snapshots, reason?}
+      - triggered：当日已触发影子条件（含触发时间）
+      - not_triggered：判定完成且未触发（历史已足够）
+      - undetermined：历史不足或报告尚未落盘（不在判定器的低吸表中）
+
+    与 record() 完全分离：本函数只读报告，不创建样本、不改影子库。
+    """
+    files = day_files(date_str)
+    history, names, plates = group_histories(files)
+    badges = {}
+    for code, snaps in history.items():
+        snaps.sort(key=lambda s: s["time"])
+        tg = evaluate_history(code, names.get(code, ""), plates.get(code, ""), snaps, date_str)
+        if tg:
+            badges[code] = {
+                "status": BADGE_TRIGGERED,
+                "trigger_time": tg["trigger_time"],
+                "snapshots": len(snaps),
+            }
+        elif len(snaps) < D1_LOOKBACK + 1:
+            badges[code] = {
+                "status": BADGE_UNDETERMINED,
+                "snapshots": len(snaps),
+                "reason": f"快照不足（{len(snaps)}<{D1_LOOKBACK + 1}）",
+            }
+        else:
+            badges[code] = {"status": BADGE_NOT_TRIGGERED, "snapshots": len(snaps)}
+    return badges
+
+
 def record(triggers):
-    """写入影子库 divergence 类；字段与 shadow_tracker 结算/报表管线完全对齐。"""
-    db = init_db()
-    db["targets"].setdefault(
-        "divergence", {"name": "龙头分歧识别(divergence_leader)", "target_samples": 20})
-    db["samples"].setdefault("divergence", [])
-    exist_ids = {s.get("id") for s in db["samples"]["divergence"]}
-    legacy_keys = {f"{s.get('code')}_{s.get('date')}" for s in db["samples"]["divergence"]}
-    added = 0
-    for tg in triggers:
-        new_id = f"DIV_{tg['date']}_{tg['code']}"
-        legacy_key = f"{tg['code']}_{tg['date']}"
-        if new_id in exist_ids or legacy_key in legacy_keys:
-            continue
-        db["samples"]["divergence"].append({
-            "id": new_id,
-            "mechanism": "divergence",
-            "code": tg["code"], "name": tg["name"], "date": tg["date"],
-            "trigger_time": tg["trigger_time"],
-            "report_file": tg.get("report_file", ""),
-            "trigger_price": round(float(tg["trigger_price"]), 2),
-            "plate": tg["plate"],
-            "mainp_pct": round(float(tg["mainp"]), 2),
-            "xl_wan": round(float(tg["xl"]), 1),
-            "pullback_pct": round(float(tg["pull"]), 2),
-            "dominance_label": tg.get("dom_label", ""),
-            "scenario": tg["scenario"],
-            "t1_result": None,
-        })
-        added += 1
-    save_db(db)
+    """Add divergence samples inside shadow_tracker's complete DB transaction."""
+    def add_triggers(db):
+        db["targets"].setdefault(
+            "divergence", {"name": "龙头分歧识别(divergence_leader)", "target_samples": 20})
+        db["samples"].setdefault("divergence", [])
+        exist_ids = {s.get("id") for s in db["samples"]["divergence"]}
+        legacy_keys = {f"{s.get('code')}_{s.get('date')}" for s in db["samples"]["divergence"]}
+        added = 0
+        for tg in triggers:
+            new_id = f"DIV_{tg['date']}_{tg['code']}"
+            legacy_key = f"{tg['code']}_{tg['date']}"
+            if new_id in exist_ids or legacy_key in legacy_keys:
+                continue
+            db["samples"]["divergence"].append({
+                "id": new_id,
+                "mechanism": "divergence",
+                "code": tg["code"], "name": tg["name"], "date": tg["date"],
+                "trigger_time": tg["trigger_time"],
+                "report_file": tg.get("report_file", ""),
+                "trigger_price": round(float(tg["trigger_price"]), 2),
+                "plate": tg["plate"],
+                "mainp_pct": round(float(tg["mainp"]), 2),
+                "xl_wan": round(float(tg["xl"]), 1),
+                "pullback_pct": round(float(tg["pull"]), 2),
+                "dominance_label": tg.get("dom_label", ""),
+                "scenario": tg["scenario"],
+                "t1_result": None,
+            })
+            exist_ids.add(new_id)
+            legacy_keys.add(legacy_key)
+            added += 1
+        return added
+
+    added, db = mutate_db(add_triggers)
     total = len(db["samples"]["divergence"])
     print(f"\n[record] 写入 divergence 样本 {added} 条 → {SHADOW_DB_FILE.name}"
           f"（当前 {total}/20）")

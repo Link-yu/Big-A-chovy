@@ -36,11 +36,15 @@ RUN mkdir -p /app/runtime /app/筛选结果 /app/决策记录 /app/tools/shadow_
     && ln -s /app/runtime/gui_settings.json \
         /app/daily-stock-analysis/scripts/gui_settings.json \
     && ln -s /app/runtime/.em_nontrading_refresh \
-        /app/daily-stock-analysis/scripts/.em_nontrading_refresh
+        /app/daily-stock-analysis/scripts/.em_nontrading_refresh \
+    && ln -s /app/runtime/update_check.json \
+        /app/daily-stock-analysis/scripts/update_check.json
 
 EXPOSE 8765
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/api/status', timeout=4)"
 
-CMD ["python", "daily-stock-analysis/scripts/realtime_dashboard.py"]
+# The workbench includes the original dashboard routes at / and adds
+# /workbench plus the toolbox APIs on the same port.
+CMD ["python", "daily-stock-analysis/scripts/web_workbench.py", "--host", "0.0.0.0", "--no-browser"]

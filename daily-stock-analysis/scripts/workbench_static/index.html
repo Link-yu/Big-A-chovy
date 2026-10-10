@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A股筛选工作台</title>
+<link rel="stylesheet" href="/workbench.css">
+<link rel="stylesheet" href="/common.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-left">
+    <nav class="view-switch" aria-label="视图切换">
+      <a class="vs-item" href="/">实时看板</a>
+      <a class="vs-item current" href="/workbench" aria-current="page">筛选工作台</a>
+    </nav>
+    <h1>A股筛选工作台</h1>
+    <span id="server-status" class="status-badge">连接中...</span>
+    <span id="clock" class="meta-text"></span>
+  </div>
+  <nav class="tabs">
+    <button class="tab-btn active" data-tab="screen">筛选任务</button>
+    <button class="tab-btn" data-tab="reports">报告库</button>
+    <button class="tab-btn" data-tab="tools">工具箱</button>
+    <button class="tab-btn" data-tab="config">参数配置</button>
+  </nav>
+</header>
+
+<div id="action-notice" class="ss-notice hidden" role="status"></div>
+
+<div class="shared-status" id="shared-status" aria-label="运行状态"></div>
+
+<div id="update-notice" class="update-notice hidden" role="status" aria-label="版本与更新"></div>
+
+<main>
+  <!-- ============ 筛选任务 ============ -->
+  <section id="tab-screen" class="tab-panel active">
+    <div class="card">
+      <div class="card-head">
+        <h2>一次性筛选任务</h2>
+        <span class="scope-chip" title="这里的设置只作用于这一次手动筛选；看板自动刷新用它自己的持久设置">本次任务参数</span>
+      </div>
+      <p class="hint">与实时看板共用同一条筛选管线与同一把筛选锁：同一时刻只有一个入口在跑。<b>首次运行（K线缓存冷）可能需要数分钟</b>，完成后报告自动保存到 <code>筛选结果/</code>。</p>
+      <div class="form-row">
+        <fieldset class="inline">
+          <legend>筛选模块</legend>
+          <label class="toggle"><input type="checkbox" id="mode-strict" checked> 严格双池</label>
+          <label class="toggle"><input type="checkbox" id="mode-low" checked> 低吸池</label>
+          <label class="toggle"><input type="checkbox" id="mode-watchlist" checked> 明日观察池</label>
+        </fieldset>
+        <label>输出条数 <input type="number" id="top" value="15" min="3" max="50" class="num"></label>
+        <label>网络模式
+          <select id="network-mode">
+            <option value="auto" selected>auto（实测择优）</option>
+            <option value="direct">direct（强制直连）</option>
+            <option value="proxy">proxy（仅代理）</option>
+          </select>
+        </label>
+      </div>
+      <div class="form-row">
+        <span class="rule-chip" title="公告 avoid/unknown 是框架一票否决门禁，任何入口都不能关闭">公告检查：强制开启</span>
+        <label class="toggle" title="关闭后不做资金排名，候选按其他条件排序"><input type="checkbox" id="rank-capital" checked> 资金排名</label>
+        <span id="dashboard-options-hint" class="meta-text"></span>
+      </div>
+      <div class="form-row">
+        <button id="run-btn" class="btn btn-primary">▶ 开始筛选</button>
+        <span id="job-state" class="meta-text"></span>
+      </div>
+      <div id="job-progress" class="progress hidden"><div class="bar"></div></div>
+      <p class="hint" id="job-progress-hint" style="display:none">筛选进行中，行情分页 → K线增强 → 资金/公告检查依次执行；冷缓存首次运行较慢，请耐心等待</p>
+    </div>
+
+    <div id="screen-summary" class="summary hidden"></div>
+    <div id="screen-result" class="md-view hidden"></div>
+  </section>
+
+  <!-- ============ 报告库 ============ -->
+  <section id="tab-reports" class="tab-panel">
+    <div class="card">
+      <div class="form-row spread">
+        <h2>筛选报告库 <span id="reports-count" class="meta-text"></span></h2>
+        <button id="reports-refresh" class="btn">刷新列表</button>
+      </div>
+      <div id="reports-table" class="table-wrap"></div>
+    </div>
+    <div id="report-viewer" class="hidden">
+      <div class="form-row spread">
+        <button id="report-back" class="btn">← 返回列表</button>
+        <span id="report-title" class="meta-text"></span>
+      </div>
+      <div id="report-content" class="md-view"></div>
+    </div>
+  </section>
+
+  <!-- ============ 工具箱 ============ -->
+  <section id="tab-tools" class="tab-panel">
+    <div class="tools-grid">
+      <div class="card">
+        <h2>实时行情 / 五档</h2>
+        <div class="form-row">
+          <input type="text" id="quote-codes" placeholder="代码，逗号分隔：600188, 000768" class="grow">
+          <label class="toggle"><input type="checkbox" id="quote-minute"> 分时</label>
+          <label class="toggle"><input type="checkbox" id="quote-kline"> 日K</label>
+          <button class="btn btn-primary" id="quote-btn">查询</button>
+        </div>
+        <div id="quote-out" class="tool-out"></div>
+      </div>
+
+      <div class="card">
+        <h2>基本面查询（建仓前必验）</h2>
+        <div class="form-row">
+          <input type="text" id="fin-code" placeholder="股票代码：600188" class="grow">
+          <button class="btn btn-primary" id="fin-btn">查询</button>
+        </div>
+        <div id="fin-out" class="tool-out"></div>
+      </div>
+
+      <div class="card evidence-cockpit">
+        <div class="card-head">
+          <h2>证据核验舱</h2>
+          <span class="scope-chip">按需 · 只读</span>
+        </div>
+        <p class="hint">一次选择多个主题，独立返回来源、时点、缓存与空/失败状态。它们是候选核验证据，不会自动改变评分、门禁或买入权限。</p>
+        <div class="form-row">
+          <input type="text" id="evidence-code" placeholder="代码：600519" class="grow" aria-label="证据核验股票代码">
+          <label>观察日 <input type="text" id="evidence-date" placeholder="YYYY-MM-DD，可空" class="num"></label>
+          <label>商品 <select id="evidence-commodity" aria-label="商品合约">
+            <option value="copper">铜 · COMEX</option>
+            <option value="gold">金 · COMEX</option>
+            <option value="crude_oil">原油 · NYMEX</option>
+          </select></label>
+          <label class="toggle"><input type="checkbox" id="evidence-force"> 强制刷新</label>
+          <button class="btn btn-primary" id="evidence-btn">核验证据</button>
+        </div>
+        <div class="evidence-topic-grid" role="group" aria-label="证据主题">
+          <label><input type="checkbox" name="evidence-topic" value="ticks" checked> 分笔</label>
+          <label><input type="checkbox" name="evidence-topic" value="financials" checked> 已披露财务</label>
+          <label><input type="checkbox" name="evidence-topic" value="events"> 隔夜事件</label>
+          <label><input type="checkbox" name="evidence-topic" value="themes"> 题材/主题</label>
+          <label><input type="checkbox" name="evidence-topic" value="news"> 新闻</label>
+          <label><input type="checkbox" name="evidence-topic" value="interaction"> 公司问答</label>
+          <label><input type="checkbox" name="evidence-topic" value="dragon_tiger"> 龙虎榜</label>
+          <label><input type="checkbox" name="evidence-topic" value="commodity"> 商品背景</label>
+          <label><input type="checkbox" name="evidence-topic" value="monitor"> 监控状态</label>
+          <label><input type="checkbox" name="evidence-topic" value="anomaly"> 异动记录</label>
+        </div>
+        <div class="evidence-background-row">
+          <button class="btn" id="calendar-btn">查交易日历</button>
+          <button class="btn" id="sentiment-btn">查市场情绪</button>
+          <span class="meta-text">日历未确认时不推进 T+1 或自动筛选。</span>
+        </div>
+        <p class="hint evidence-scope-note">时点口径：事件/龙虎榜支持观察日截止；财务显示最新披露；分笔仅支持当前交易日；商品合约按上方选择。</p>
+        <div id="evidence-out" class="evidence-out" aria-live="polite"></div>
+      </div>
+
+      <div class="card">
+        <h2>报告扫描（5/5 与 4/5 判定）</h2>
+        <div class="form-row">
+          <label>日期 <input type="text" id="scan-date" placeholder="YYYYMMDD，可空" class="num"></label>
+          <label>最新 <input type="number" id="scan-latest" value="5" min="1" max="30" class="num"></label>
+          <button class="btn btn-primary" id="scan-btn">扫描</button>
+        </div>
+        <div id="scan-out" class="tool-out"></div>
+      </div>
+
+      <div class="card">
+        <h2>持仓 / 观察池快照</h2>
+        <div class="form-row">
+          <label>日期 <input type="text" id="pos-date" placeholder="YYYYMMDD，默认最新" class="num"></label>
+          <button class="btn btn-primary" id="pos-btn">读取</button>
+        </div>
+        <div id="pos-out" class="tool-out"></div>
+      </div>
+
+      <div class="card">
+        <h2>T+1 观察池验证</h2>
+        <div class="form-row">
+          <label>日期 <input type="text" id="t1-date" placeholder="YYYYMMDD（必填）" class="num"></label>
+          <button class="btn btn-primary" id="t1-btn">验证</button>
+        </div>
+        <div id="t1-out" class="tool-out"></div>
+      </div>
+
+      <div class="card">
+        <h2>单股全天跟踪</h2>
+        <div class="form-row">
+          <input type="text" id="track-code" placeholder="代码或名称" class="grow">
+          <label>日期 <input type="text" id="track-date" placeholder="YYYYMMDD，可空" class="num"></label>
+          <button class="btn btn-primary" id="track-btn">跟踪</button>
+        </div>
+        <div id="track-out" class="tool-out"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 参数配置 ============ -->
+  <section id="tab-config" class="tab-panel">
+    <div class="card">
+      <div class="card-head">
+        <h2>参数配置</h2>
+        <span class="scope-chip" title="看板持久口径，对下一轮筛选生效；不改变任何买入权限">全局口径</span>
+      </div>
+      <p class="hint">这里只调整看板的展示与运行口径，不能授予模拟仓或真实仓买入权限。买卖裁决以《选股框架.md》为准。</p>
+
+      <div id="config-status" class="config-status"></div>
+      <div id="config-error" class="config-error hidden"></div>
+
+      <fieldset class="config-block">
+        <legend>负超单观察</legend>
+        <label class="toggle"><input type="radio" name="neg-view" value="strict"> 严格展示（默认，只显示现有正式列表）</label>
+        <label class="toggle"><input type="radio" name="neg-view" value="observe"> 开启观察（增加独立的负超单观察列表）</label>
+        <p class="hint">两档都维持真实仓否决：超大单为负 = 禁止正式买入建议。观察列表只展示事实与卡点，原有正式列表、排名和资格不变。</p>
+      </fieldset>
+
+      <fieldset class="config-block">
+        <legend>交易板范围</legend>
+        <div class="form-row">
+          <label class="toggle"><input type="checkbox" id="cfg-board-main"> 沪深主板</label>
+          <label class="toggle"><input type="checkbox" id="cfg-board-chinext"> 创业板</label>
+          <label class="toggle"><input type="checkbox" id="cfg-board-star"> 科创板</label>
+        </div>
+        <p class="hint">
+          默认只选沪深主板（与历史基线一致）。勾选后，该交易板的股票<b>统一参与完整筛选</b>：资金增量与状态 →
+          超短池／趋势池 → 双池交集 → 资金优选／低吸／明日观察池 → 现有状态机，使用<b>同一套门槛与排名</b>
+          （三板都读 <code>tools/rule_config.py</code>，暂不单独放大两板阈值；超出现有涨幅/价格区间的股票被排除属正常筛选结果）。
+          取消勾选则该板不参与新增候选；已持仓股票的监控不受影响。北交所暂不在选项内。<b>至少选择一个交易板。</b>
+        </p>
+        <p class="hint">此设置对本实例的所有访问者生效（单实例共享配置）。切换范围后，旧范围留下的锁存/等待回踩状态会被剔除（已持仓保留监控）。</p>
+      </fieldset>
+
+      <fieldset class="config-block">
+        <legend>固定规则（只读）</legend>
+        <ul class="rule-list">
+          <li>超大单为负：禁止正式买入建议（真实仓一票否决）</li>
+          <li>真实仓主导资格须为 <code>absolute</code></li>
+          <li>公告 <code>avoid</code>/<code>unknown</code>：一票否决</li>
+        </ul>
+        <p class="hint">规则语义以《选股框架.md》为准；本页不能改变这些门禁，也没有普通开关可关掉它们。</p>
+      </fieldset>
+
+      <fieldset class="config-block">
+        <legend>看板运行参数</legend>
+        <div class="form-row">
+          <label>输出条数 <input type="number" id="cfg-top" min="3" max="50" class="num"></label>
+          <label>刷新间隔(秒) <input type="number" id="cfg-interval" min="10" max="600" class="num"></label>
+          <label>网络模式
+            <select id="cfg-network">
+              <option value="auto">auto（实测择优）</option>
+              <option value="direct">direct（强制直连）</option>
+              <option value="proxy">proxy（仅代理）</option>
+            </select>
+          </label>
+        </div>
+        <p class="hint">公告检查与正式资金排序属规则要求，不提供普通运行开关。</p>
+      </fieldset>
+
+      <div class="form-row">
+        <button id="config-apply" class="btn btn-primary">保存配置</button>
+        <span id="config-apply-state" class="meta-text"></span>
+      </div>
+      <p class="hint" id="config-impact"></p>
+    </div>
+  </section>
+</main>
+
+<footer class="foot meta-text">
+  筛选结果只是发现候选，不构成买卖建议；交易规则以《选股框架.md》为准，不会自动下单。
+</footer>
+
+<script src="/common.js"></script>
+<script src="/workbench.js"></script>
+</body>
+</html>

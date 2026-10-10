@@ -26,6 +26,9 @@ __pycache__/
 daily-stock-analysis/scripts/.kline_cache.json
 daily-stock-analysis/scripts/flow_snapshot.json
 daily-stock-analysis/scripts/.announcement_risk_cache.json
+daily-stock-analysis/scripts/.a_share_data_*.json
+daily-stock-analysis/scripts/..a_share_data_*.json.lock
+daily-stock-analysis/scripts/update_check.json
 daily-stock-analysis/scripts/watchlist_breakout_state.json
 daily-stock-analysis/.rollback-backup-*/
 daily-stock-analysis/scripts/keep_proxy_alive.sh.bak.*
@@ -36,6 +39,7 @@ daily-stock-analysis/scripts/last_valid_result.json
 daily-stock-analysis/scripts/intersection_state.json
 daily-stock-analysis/scripts/holdings.json
 daily-stock-analysis/scripts/gui_settings.json
+daily-stock-analysis/scripts/dashboard_settings.json
 daily-stock-analysis/scripts/.em_nontrading_refresh
 tools/shadow_data/shadow_samples.json
 # 模拟盘账户、持仓与交易记录（本地私有，含本机路径，禁止上传）

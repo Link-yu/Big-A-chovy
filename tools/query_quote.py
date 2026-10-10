@@ -2,17 +2,26 @@
 # -*- coding: utf-8 -*-
 """
 实时行情、五档盘口与分时K线快速查询工具
-数据源：腾讯金融 API (qt.gtimg.cn / web.ifzq.gtimg.cn)
+数据源：腾讯金融 API (qt.gtimg.cn / 腾讯日K多主机，见 tencent_kline)
 """
 
 import sys
 import json
-import ssl
 import urllib.request
 import argparse
-from typing import List, Dict, Any
+from datetime import datetime
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+from zoneinfo import ZoneInfo
 
-ssl_ctx = ssl._create_unverified_context()
+_SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "daily-stock-analysis" / "scripts"
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+import tencent_kline  # noqa: E402  腾讯日 K 主机列表单一来源
+import tls_context  # noqa: E402  TLS 校验上下文唯一来源（默认校验证书）
+
+ssl_ctx = tls_context.build_context()
+SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 def normalize_code(code: str) -> str:
     """自动添加市场前缀 sh / sz"""
@@ -22,6 +31,20 @@ def normalize_code(code: str) -> str:
     if code_clean.startswith("6") or code_clean.startswith("9"):
         return f"sh{code_clean}"
     return f"sz{code_clean}"
+
+
+def _quote_number(parts: List[str], index: int) -> float:
+    """Read one optional numeric Tencent field without shifting its sibling."""
+    if index >= len(parts):
+        return 0.0
+    value = parts[index].strip().strip('"')
+    if not value:
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
 
 def fetch_realtime_quotes(codes: List[str]) -> Dict[str, Dict[str, Any]]:
     """批量查询实时行情与五档买卖盘口"""
@@ -83,37 +106,79 @@ def fetch_realtime_quotes(codes: List[str]) -> Dict[str, Dict[str, Any]]:
             "time": time_str,
             "buy_orders": buy_orders,
             "sell_orders": sell_orders,
-            "zt": float(parts[48]) if len(parts) > 48 and parts[48] else 0.0,
-            "dt": float(parts[47]) if len(parts) > 47 and parts[47] else 0.0,
+            # 腾讯行情零基字段：47 为涨停价，48 为跌停价。
+            "zt": _quote_number(parts, 47),
+            "dt": _quote_number(parts, 48),
         }
 
     return results
 
-def fetch_minute_data(code: str) -> List[str]:
-    """查询当日1分钟分时明细"""
+def fetch_minute_data(code: str, expected_date: Optional[str] = None) -> List[str]:
+    """查询当前交易日 1 分钟分时明细。
+
+    ``expected_date`` is an optional guard for callers that have a known
+    market date.  Tencent's minute endpoint is current-day-only, so a
+    request for another date must return no evidence rather than silently
+    handing today's bars to a historical caller.  The one-argument calling
+    convention remains unchanged for the interactive quote tools.
+    """
     sym = normalize_code(code)
+    normalized_expected_date: Optional[str] = None
+    if expected_date is not None:
+        normalized_expected_date = str(expected_date).strip().replace("-", "")
+        if len(normalized_expected_date) != 8 or not normalized_expected_date.isdigit():
+            return []
+        try:
+            normalized_expected_date = datetime.strptime(
+                normalized_expected_date, "%Y%m%d"
+            ).strftime("%Y%m%d")
+        except ValueError:
+            return []
+        if datetime.now(SHANGHAI_TZ).strftime("%Y%m%d") != normalized_expected_date:
+            return []
+
     url = f"https://web.ifzq.gtimg.cn/appstock/app/minute/query?code={sym}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
         with urllib.request.urlopen(req, context=ssl_ctx, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        sub_key = list(data.get("data", {}).keys())[0]
-        m_lines = data["data"][sub_key]["data"]["data"]
+        securities = data.get("data")
+        if not isinstance(securities, dict):
+            return []
+        security = securities.get(sym)
+        if not isinstance(security, dict):
+            return []
+        minute_payload = security.get("data")
+        if not isinstance(minute_payload, dict):
+            return []
+        # expected_date 模式下，电脑自然日只是第一道护栏；响应本身的
+        # 证券交易日也必须存在且完全匹配，不能把旧缓存标成目标日证据。
+        if normalized_expected_date is not None:
+            response_date = str(minute_payload.get("date") or "").strip().replace("-", "")
+            if len(response_date) != 8 or not response_date.isdigit():
+                return []
+            try:
+                response_date = datetime.strptime(response_date, "%Y%m%d").strftime("%Y%m%d")
+            except ValueError:
+                return []
+            if response_date != normalized_expected_date:
+                return []
+        m_lines = minute_payload.get("data")
+        if not isinstance(m_lines, list):
+            return []
         return m_lines
     except Exception as e:
         print(f"获取分时失败: {e}", file=sys.stderr)
         return []
 
 def fetch_daily_kline(code: str, count: int = 10) -> List[Dict[str, Any]]:
-    """查询近期前复权日K线"""
+    """查询近期前复权日K线（主机列表共用 tencent_kline，且要求确实是前复权数据）"""
     sym = normalize_code(code)
-    url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={sym},day,,,{count + 1},qfq"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
-        with urllib.request.urlopen(req, context=ssl_ctx, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        sym_data = data.get("data", {}).get(sym, {})
-        days = sym_data.get("qfqday") or sym_data.get("day") or []
+        # require_qfq=True：本函数对外承诺"前复权"，因此拒绝腾讯的未复权 day 回退，
+        # 宁可报错也不把未复权价当复权价展示。
+        payload, _ = tencent_kline.fetch_kline_json(sym, count + 1, require_qfq=True, timeout=10)
+        days = tencent_kline.kline_rows(payload, sym, require_qfq=True)
         # format: [date, open, close, high, low, volume, ...]
         out = []
         for i in range(len(days)):

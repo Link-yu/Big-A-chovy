@@ -10,6 +10,39 @@ import re
 import glob
 from typing import Dict, List, Any, Optional
 
+
+_REPORT_FILENAME_RE = re.compile(r"^A股筛选结果_(?P<date>\d{8})_(?P<time>\d{4})\.md$")
+
+
+def _report_identity(filepath: str) -> Optional[tuple[str, str]]:
+    """Return the report date/time encoded in a filename, if it is valid."""
+    match = _REPORT_FILENAME_RE.match(os.path.basename(filepath))
+    if not match:
+        return None
+    return match.group("date"), match.group("time")
+
+
+def _sort_report_files(paths: List[str], date_str: Optional[str] = None) -> List[str]:
+    """De-duplicate and sort reports by the timestamp in their filename.
+
+    Reports may be mixed between the historical flat directory and a dated
+    archive directory.  Sorting the full path would put the directory name
+    before the report time, which can make an archived 11:35 report appear
+    before a flat 09:10 report.  The filename timestamp is the authority.
+    """
+    sortable: List[tuple[str, str, str]] = []
+    for filepath in set(paths):
+        if not os.path.isfile(filepath):
+            continue
+        identity = _report_identity(filepath)
+        if identity is None:
+            continue
+        report_date, report_time = identity
+        if date_str is not None and report_date != date_str:
+            continue
+        sortable.append((report_date, report_time, filepath))
+    return [filepath for _date, _time, filepath in sorted(sortable)]
+
 def parse_markdown_table(lines: List[str], start_idx: int) -> tuple:
     """
     解析 Markdown 表格，从 start_idx 行开始（表头行）。
@@ -171,32 +204,32 @@ def parse_screening_report(filepath: str) -> Dict[str, Any]:
 
 def get_report_files(base_dir: str, date_str: Optional[str] = None) -> List[str]:
     """获取指定日期或最新一天的所有报告文件列表（按时间排序）"""
+    if not os.path.isdir(base_dir):
+        return []
+
     if date_str:
+        found: List[str] = []
         target_dir = os.path.join(base_dir, date_str)
         if os.path.isdir(target_dir):
-            files = sorted(glob.glob(os.path.join(target_dir, "A股筛选结果_*.md")))
-            if files:
-                return files
-        direct_files = sorted(glob.glob(os.path.join(base_dir, f"A股筛选结果_{date_str}_*.md")))
-        if direct_files:
-            return direct_files
-        return []
+            found.extend(glob.glob(os.path.join(target_dir, "A股筛选结果_*.md")))
+        found.extend(glob.glob(os.path.join(base_dir, f"A股筛选结果_{date_str}_*.md")))
+        return _sort_report_files(found, date_str=date_str)
     
-    # 查找最新的日期文件夹或直接文件
-    direct_files = sorted(glob.glob(os.path.join(base_dir, "A股筛选结果_*.md")))
-    if direct_files:
-        # 提取最新日期
-        dates = []
-        for f in direct_files:
-            m = re.search(r"(\d{8})_\d{4}", os.path.basename(f))
-            if m:
-                dates.append(m.group(1))
-        if dates:
-            latest_date = max(dates)
-            return sorted(glob.glob(os.path.join(base_dir, f"A股筛选结果_{latest_date}_*.md")))
+    # 查找所有实际存在的报告（从子目录与平铺文件中汇总）。空日期目录
+    # 不能把默认“最新日期”推进到一个没有报告的日期。
+    found: List[str] = list(glob.glob(os.path.join(base_dir, "A股筛选结果_*.md")))
+    for dirname in os.listdir(base_dir):
+        target_dir = os.path.join(base_dir, dirname)
+        if os.path.isdir(target_dir) and re.match(r"^\d{8}$", dirname):
+            found.extend(glob.glob(os.path.join(target_dir, "A股筛选结果_*.md")))
 
-    all_subdirs = sorted([d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d)) and re.match(r"^\d{8}$", d)])
-    if not all_subdirs:
+    sorted_files = _sort_report_files(found)
+    all_dates = {identity[0] for filepath in sorted_files
+                 if (identity := _report_identity(filepath)) is not None}
+
+    if not all_dates:
         return []
-    latest_day = all_subdirs[-1]
-    return sorted(glob.glob(os.path.join(base_dir, latest_day, "A股筛选结果_*.md")))
+
+    latest_date = max(all_dates)
+    return [filepath for filepath in sorted_files
+            if _report_identity(filepath)[0] == latest_date]

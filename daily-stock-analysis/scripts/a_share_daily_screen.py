@@ -15,8 +15,8 @@ import math
 import os
 import random
 import re
-import ssl
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -47,9 +47,28 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-from tools.rule_config import RULE_CONFIG, get_rule_config  # noqa: E402
+from tools.rule_config import RULE_CONFIG, get_rule_config, hhmm_to_minutes  # noqa: E402
+from tools.data_sources.announcements import (  # noqa: E402
+    classify_announcement_risk as _canonical_announcement_risk,
+    extract_primary_announcement_container,
+    extract_primary_announcement_total,
+    fetch_announcement_evidence,
+    validate_primary_announcement_page,
+)
+from tools.data_sources.cninfo import CNInfoAnnouncementSource  # noqa: E402
+from tools.data_sources.background import build_market_background  # noqa: E402
+from tools.data_sources.http import project_http_client  # noqa: E402
+
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+import tencent_kline  # noqa: E402
+import runtime_paths  # noqa: E402  运行状态路径唯一来源（A_SHARE_STATE_DIR 可定向到临时目录）
+import state_commit  # noqa: E402  回合状态提交门（超时轮不得提交运行状态）
+import tls_context  # noqa: E402  TLS 校验上下文唯一来源（默认校验证书）
 
 RISK_CONFIG = RULE_CONFIG["risk"]
+SCREENING_CONFIG = RULE_CONFIG["screening"]
+EXECUTION_CONFIG = RULE_CONFIG["execution"]
 RISK_STATUSES = RISK_CONFIG["statuses"]
 RISK_CLEAN = RISK_STATUSES["clean"]
 RISK_WATCH = RISK_STATUSES["watch_risk"]
@@ -60,7 +79,9 @@ RISK_CHECKED_VALUES = frozenset({RISK_CLEAN, RISK_WATCH, RISK_AVOID})
 
 TZ = ZoneInfo("Asia/Shanghai")
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X) daily-stock-analysis/1.0"
-SSL_CONTEXT = ssl._create_unverified_context()
+# 默认做完整证书校验（实测所有行情主机证书链有效）。需要自签 CA 时配置
+# A_SHARE_CA_BUNDLE 而不是关掉校验；证书失败按数据不可用处理。
+SSL_CONTEXT = tls_context.build_context()
 import network_path  # 多路径实测延迟择优（直连+候选代理端口），软件无关
 
 # ── Per-host circuit breaker ──────────────────────────────────────────
@@ -95,7 +116,7 @@ def _mark_host_ok(url: str) -> None:
 # When ALL hosts fail in a run, record the timestamp.  Subsequent runs
 # within _EM_COOLDOWN seconds skip East Money entirely and go straight
 # to the Sina fallback, saving ~30 s of wasted retry time.
-_EM_COOLDOWN_FILE = SCRIPT_DIR / ".em_cooldown"
+_EM_COOLDOWN_FILE = runtime_paths.state_file(".em_cooldown")
 # 指数退避：第1次封 120s → 第2次 300s → 第3次起 600s
 _EM_COOLDOWN_BACKOFF = [120, 300, 600]
 
@@ -143,37 +164,53 @@ def _em_clear_cooldown() -> None:
     except OSError:
         pass
 
-# 2026-07-30: 东财对海外出口 IP 把 push2 302 到 push2delay，且 push2 间歇 502（~75%失败）。
-# push2delay 对 A 股仍是实时数据（dlmkts 仅对港美股延迟），实测 100% 稳定，故提升为首选。
+# 2026-09-24: 当前网络路径下标准 clist/ulist 入口失败；push2、82/72/83.push2 的
+# /webguest 入口返回有效数据。push2delay/webguest 未通过探测，因此不列为候选。
 CLIST_URLS = [
-    "https://push2delay.eastmoney.com/api/qt/clist/get",
-    "https://push2.eastmoney.com/api/qt/clist/get",
-    "https://82.push2.eastmoney.com/api/qt/clist/get",
-    "https://72.push2.eastmoney.com/api/qt/clist/get",
-    "https://83.push2.eastmoney.com/api/qt/clist/get",
+    "https://push2.eastmoney.com/webguest/api/qt/clist/get",
+    "https://82.push2.eastmoney.com/webguest/api/qt/clist/get",
+    "https://72.push2.eastmoney.com/webguest/api/qt/clist/get",
+    "https://83.push2.eastmoney.com/webguest/api/qt/clist/get",
 ]
-# The push2 aliases share the same upstream service.  They are useful for a
-# transient CDN fault, but repeatedly trying every alias can turn one blocked
-# request into minutes of waiting.  Startup therefore uses a short list of
-# hosts before falling back to an independent provider.
+# Keep startup discovery on the same webguest route used by subsequent pages.
 CLIST_STARTUP_URLS = [
-    "https://push2delay.eastmoney.com/api/qt/clist/get",
-    "https://push2.eastmoney.com/api/qt/clist/get",
-    "https://82.push2.eastmoney.com/api/qt/clist/get",
+    "https://push2.eastmoney.com/webguest/api/qt/clist/get",
+    "https://82.push2.eastmoney.com/webguest/api/qt/clist/get",
 ]
 SINA_MARKET_URL = "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData"
 SINA_PAGE_SIZE = 100
 SINA_MAX_PAGES = 70
 INDEX_URLS = [
-    "https://push2delay.eastmoney.com/api/qt/ulist.np/get",
-    "https://push2.eastmoney.com/api/qt/ulist.np/get",
-    "https://82.push2.eastmoney.com/api/qt/ulist.np/get",
-    "https://72.push2.eastmoney.com/api/qt/ulist.np/get",
-    "https://83.push2.eastmoney.com/api/qt/ulist.np/get",
+    "https://push2.eastmoney.com/webguest/api/qt/ulist.np/get",
+    "https://82.push2.eastmoney.com/webguest/api/qt/ulist.np/get",
+    "https://72.push2.eastmoney.com/webguest/api/qt/ulist.np/get",
+    "https://83.push2.eastmoney.com/webguest/api/qt/ulist.np/get",
 ]
-TENCENT_KLINE_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"  # deprecated: returns 501
+# 腾讯日 K 主机列表收口在 tencent_kline 模块（引擎 / 看板 / 命令行工具共用一份），
+# 单一来源避免"改一处漏三处"；WAF 实测记录见该模块 docstring。
+TENCENT_KLINE_URLS = list(tencent_kline.TENCENT_KLINE_URLS)
+TENCENT_KLINE_URL = TENCENT_KLINE_URLS[0]  # 兼容旧调用点
 SINA_KLINE_URL = "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
-EM_KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+# 东财日 K（push2his）——第二档备源。2026-09-25 实测该路径被断而停用，2026-09-28 复测已恢复：
+# 前复权（与腾讯同日收盘差 ≤0.2%）、含当日 bar，覆盖沪深主板/创业板/科创板/北交所。
+# 与腾讯**非同厂商**，所以作为并列的第二档：2026-09-28 腾讯整链连续失败 47 分钟时，
+# 若有这一档就不必整轮吃新浪不复权数据（实测池子被压掉约一半）。
+EM_KLINE_URLS: Tuple[str, ...] = (
+    "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+    "https://1.push2his.eastmoney.com/api/qt/stock/kline/get",
+    "https://82.push2his.eastmoney.com/api/qt/stock/kline/get",
+)
+EM_KLINE_URL = EM_KLINE_URLS[0]  # 兼容旧调用点与文档引用
+# 东财 kline 的 fields2=f51..f61 列序与腾讯 qfqday 前 6 列一致（date,open,close,high,low,vol），
+# 因此两档可共用 parse_k_rows，不必各写一个解析器。
+EM_KLINE_FIELDS1 = "f1,f2,f3,f4,f5,f6"
+EM_KLINE_FIELDS2 = "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"
+# 当日 1 分钟累计资金流序列。本地快照够不着 5/15 分钟基准时用它兜底，
+# 只走 push2 系主机的 /webguest 路由（push2his 无 /webguest，standards 路由已下线）。
+EM_FFLOW_MINUTE_URLS = [
+    "https://push2.eastmoney.com/webguest/api/qt/stock/fflow/kline/get",
+    "https://82.push2.eastmoney.com/webguest/api/qt/stock/fflow/kline/get",
+]
 ANNOUNCEMENT_URL = "https://np-anotice-stock.eastmoney.com/api/security/ann"
 
 CLIST_FIELDS = "f12,f14,f2,f3,f4,f5,f6,f7,f8,f10,f15,f16,f17,f18,f20,f21,f100,f124,f62,f184,f66,f69,f72,f75,f78,f81,f84,f87"
@@ -207,7 +244,7 @@ MARKET_FETCH_STATUS: Dict[str, Any] = {
     "retrieved_rows": 0,
 }
 NETWORK_MODE = "auto"
-ANNOUNCEMENT_CACHE_FILE = SCRIPT_DIR / ".announcement_risk_cache.json"
+ANNOUNCEMENT_CACHE_FILE = runtime_paths.state_file(".announcement_risk_cache.json")
 _ANNOUNCEMENT_RISK_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
 ANNOUNCEMENT_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 ANNOUNCEMENT_REQUEST_TIMEOUT_SECONDS = 4
@@ -215,7 +252,7 @@ ANNOUNCEMENT_REQUEST_TIMEOUT_SECONDS = 4
 # The raw dual-pool intersection remains an audit signal.  This second layer
 # tracks whether that signal is new, confirmed, late, or actually eligible
 # for a new position.  It never reads holdings.json or uses simulated trades.
-INTERSECTION_STATE_FILE = SCRIPT_DIR / "intersection_state.json"
+INTERSECTION_STATE_FILE = runtime_paths.state_file("intersection_state.json")
 INTERSECTION_CALIBRATION_FILE = SCRIPT_DIR / "intersection_calibration.json"
 DEFAULT_INTERSECTION_CONFIG = get_rule_config()["intersection"]
 INTERSECTION_CONFIG_VERSION = "default-v2"
@@ -322,15 +359,31 @@ WATCH_ANNOUNCEMENT_KEYWORDS = list(ANNOUNCEMENT_CONFIG["watch_keywords"])
 ANNOUNCEMENT_IGNORE_KEYWORDS = list(ANNOUNCEMENT_CONFIG["ignore_keywords"])
 
 
-def fetch_json(url: str, params: Dict[str, Any], timeout: int = 6, retries: int = 0) -> Any:
+def fetch_json(
+    url: str,
+    params: Dict[str, Any],
+    timeout: int = 6,
+    retries: int = 0,
+    *,
+    deadline: float | None = None,
+) -> Any:
     errors: Dict[str, str] = {}
-    if NETWORK_MODE == "direct":
-        sessions = [("直连", REQUESTS_DIRECT_SESSION)]
-    elif NETWORK_MODE == "proxy":
-        sessions = [("系统代理", REQUESTS_SESSION)]
-    else:
-        # auto：实测所有路径（直连+各候选代理端口）延迟，最快优先，不依赖系统代理设置
-        sessions = network_path.ordered_sessions(REQUESTS_DIRECT_SESSION)
+    independent_host = "sina.com.cn" in url
+    if requests is not None:
+        if NETWORK_MODE == "direct":
+            sessions = [("直连", REQUESTS_DIRECT_SESSION)]
+        elif NETWORK_MODE == "proxy":
+            sessions = [("系统代理", REQUESTS_SESSION)]
+        elif independent_host:
+            # 东财探测失败只说明东财不可用，不能因此把所有候选路径都从新浪
+            # 备用源的探测/实际抓取中排除。
+            sessions = network_path.ordered_independent_sessions(
+                REQUESTS_DIRECT_SESSION,
+                deadline=deadline,
+            )
+        else:
+            # auto：实测所有路径（直连+各候选代理端口）延迟，最快优先，不依赖系统代理设置
+            sessions = network_path.ordered_sessions(REQUESTS_DIRECT_SESSION)
 
     for attempt in range(retries + 1):
         try:
@@ -342,8 +395,13 @@ def fetch_json(url: str, params: Dict[str, Any], timeout: int = 6, retries: int 
                     "Accept-Language": "zh-CN,zh;q=0.9",
                 }
                 for label, session in sessions:
+                    remaining = deadline - time.monotonic() if deadline is not None else timeout
+                    if remaining <= 0:
+                        errors[label] = "deadline exceeded"
+                        break
                     try:
-                        resp = session.get(url, params=params, headers=headers, timeout=timeout, verify=False)
+                        resp = session.get(url, params=params, headers=headers, timeout=min(timeout, remaining),
+                                           verify=tls_context.requests_verify())
                         resp.raise_for_status()
                         _mark_host_ok(url)
                         return resp.json()
@@ -359,11 +417,40 @@ def fetch_json(url: str, params: Dict[str, Any], timeout: int = 6, retries: int 
                 _mark_host_failed(url)
                 raise NetworkUnavailable(url, errors)
             query = urllib.parse.urlencode(params)
-            req = urllib.request.Request(f"{url}?{query}", headers={"User-Agent": UA})
-            opener = build_url_opener(NETWORK_MODE)
-            with opener.open(req, timeout=timeout) as resp:
-                data = resp.read().decode("utf-8", errors="replace")
-            return json.loads(data)
+            request_url = f"{url}?{query}"
+            req = urllib.request.Request(request_url, headers={"User-Agent": UA})
+            if independent_host and NETWORK_MODE == "auto":
+                paths = network_path.independent_path_candidates(deadline=deadline)
+                for label, proxy in paths:
+                    remaining = deadline - time.monotonic() if deadline is not None else timeout
+                    if remaining <= 0:
+                        errors[label] = "deadline exceeded"
+                        break
+                    handlers = [urllib.request.HTTPSHandler(context=SSL_CONTEXT)]
+                    handlers.append(urllib.request.ProxyHandler(
+                        {"http": proxy, "https": proxy} if proxy else {}
+                    ))
+                    opener = urllib.request.build_opener(*handlers)
+                    try:
+                        with opener.open(req, timeout=min(timeout, remaining)) as resp:
+                            data = resp.read().decode("utf-8", errors="replace")
+                        result = json.loads(data)
+                        _mark_host_ok(url)
+                        return result
+                    except Exception as exc:
+                        errors[label] = f"{type(exc).__name__}: {' '.join(str(exc).split())[:220]}"
+            else:
+                opener = build_url_opener(NETWORK_MODE)
+                remaining = deadline - time.monotonic() if deadline is not None else timeout
+                if remaining <= 0:
+                    raise TimeoutError("deadline exceeded")
+                with opener.open(req, timeout=min(timeout, remaining)) as resp:
+                    data = resp.read().decode("utf-8", errors="replace")
+                result = json.loads(data)
+                _mark_host_ok(url)
+                return result
+            _mark_host_failed(url)
+            raise NetworkUnavailable(url, errors)
         except NetworkUnavailable:
             pass
         except Exception as exc:  # network providers are not fully stable
@@ -378,6 +465,28 @@ def fetch_json(url: str, params: Dict[str, Any], timeout: int = 6, retries: int 
 
 def is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not math.isnan(value)
+
+
+def _flow_number(value: Any) -> float | int:
+    """Normalize optional Eastmoney capital-flow fields.
+
+    Eastmoney occasionally returns ``-``/``--`` instead of a number during
+    the first minutes after the open. Keep missing flow fail-closed as zero,
+    but never let the sentinel string leak into arithmetic.
+    """
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and math.isnan(value):
+            return 0
+        return value
+    if value in (None, "", "-", "--"):
+        return 0
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0
+    return 0 if math.isnan(parsed) else parsed
 
 
 def _fmt(value: Any, nd: int = 2, default: str = "—") -> str:
@@ -472,14 +581,21 @@ class Enriched:
     small_pct: float = 0
     flow_5m_inc: float = 0
     flow_15m_inc: float = 0
+    # 增量基准来源："snapshot"=本地快照累积，"fflow"=东财当日累计分钟序列；空串=无基准
+    flow_baseline_source: str = ""
     amount_5m_inc: float = 0
     volume_5m_inc: float = 0
     vol_ratio_vs_hist: float = 0
     vol_surge: bool = False
     price_above_vwap: bool = True
     flow_status: str = "数据不足"
+    # 框架一票否决标记：超大单为负（禁止正式买入建议）。空串表示未触发。
+    flow_veto: str = ""
     buy_ratio: float = float("nan")
     risk_status: str = RISK_UNKNOWN
+    # 现价在当日区间的位置（0%=最低，100%=最高）；NaN=当日无振幅（如一字板）。
+    # 只用于报告标注，不参与任何门槛判断（2026-09-26 加入）。
+    range_pct: float = float("nan")
 
 
 def normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -502,24 +618,72 @@ def normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "float_mv": row.get("f21"),
         "industry": row.get("f100") or "-",
         "timestamp": row.get("f124") or 0,
-        "main_net": row.get("f62") or 0,
-        "main_pct": row.get("f184") or 0,
-        "super_net": row.get("f66") or 0,
-        "super_pct": row.get("f69") or 0,
-        "big_net": row.get("f72") or 0,
-        "big_pct": row.get("f75") or 0,
-        "mid_net": row.get("f78") or 0,
-        "mid_pct": row.get("f81") or 0,
-        "small_net": row.get("f84") or 0,
-        "small_pct": row.get("f87") or 0,
+        "main_net": _flow_number(row.get("f62")),
+        "main_pct": _flow_number(row.get("f184")),
+        "super_net": _flow_number(row.get("f66")),
+        "super_pct": _flow_number(row.get("f69")),
+        "big_net": _flow_number(row.get("f72")),
+        "big_pct": _flow_number(row.get("f75")),
+        "mid_net": _flow_number(row.get("f78")),
+        "mid_pct": _flow_number(row.get("f81")),
+        "small_net": _flow_number(row.get("f84")),
+        "small_pct": _flow_number(row.get("f87")),
     }
 
 
-def valid_main_board(row: Dict[str, Any]) -> bool:
-    code = str(row.get("f12", ""))
-    name = str(row.get("f14", ""))
-    if not code.startswith(("60", "00")):
+# ── 交易板分类 ───────────────────────────────────────────────────────
+# 取值与 dashboard_settings.BOARD_* 一致，但在此独立定义：筛选引擎与 CLI 都要用，
+# 不该反向依赖看板配置模块。这里的“板”是交易板（上市板块），与按行业计算的
+# 「板块共振」是两个概念。
+BOARD_MAIN = "main"
+BOARD_CHINEXT = "chinext"
+BOARD_STAR = "star"
+BOARD_UNKNOWN = "unknown"
+BOARD_ORDER = (BOARD_MAIN, BOARD_CHINEXT, BOARD_STAR)
+BOARD_LABELS = {
+    BOARD_MAIN: "沪深主板",
+    BOARD_CHINEXT: "创业板",
+    BOARD_STAR: "科创板",
+    BOARD_UNKNOWN: "未知板",
+}
+
+
+def board_of(code: Any) -> str:
+    """按代码前缀判定交易板；不确定的一律 unknown，由调用方排除。
+
+    沪深主板 60/00（含 001/002/003）、创业板 300/301、科创板 688/689。
+    北交所（43/83/87/920 等）与其它代码暂不在选项内 → unknown。
+    """
+    text = str(code or "").strip()
+    if text.startswith(("60", "00")):
+        return BOARD_MAIN
+    if text.startswith(("300", "301")):
+        return BOARD_CHINEXT
+    if text.startswith(("688", "689")):
+        return BOARD_STAR
+    return BOARD_UNKNOWN
+
+
+def normalize_boards(boards: Any) -> List[str]:
+    """把外部传入的交易板集合归一为固定顺序、去重、剔除未知值。
+
+    非法输入（空、未知值、类型错误）一律回退 ``["main"]``：失败时取**最窄**范围，
+    而不是悄悄放宽到全部交易板。
+    """
+    if isinstance(boards, str):
+        boards = [boards]
+    if not isinstance(boards, (list, tuple, set)):
+        return [BOARD_MAIN]
+    chosen = {str(item) for item in boards}
+    ordered = [board for board in BOARD_ORDER if board in chosen]
+    return ordered or [BOARD_MAIN]
+
+
+def valid_board_row(row: Dict[str, Any], boards: Any = (BOARD_MAIN,)) -> bool:
+    """所选交易板内、且字段齐全的非 ST/退市行情行。"""
+    if board_of(row.get("f12")) not in set(normalize_boards(boards)):
         return False
+    name = str(row.get("f14", ""))
     if "ST" in name.upper() or name.startswith("*") or "退" in name:
         return False
     required = ["f2", "f3", "f5", "f6", "f8", "f10", "f15", "f18", "f21"]
@@ -529,6 +693,11 @@ def valid_main_board(row: Dict[str, Any]) -> bool:
     if row.get("_source") == "sina_fallback":
         required.remove("f10")
     return all(row.get(k) not in (None, "-") for k in required)
+
+
+def valid_main_board(row: Dict[str, Any]) -> bool:
+    """兼容旧调用点：等价于只筛沪深主板。"""
+    return valid_board_row(row, (BOARD_MAIN,))
 
 
 def is_a_share_row(row: Dict[str, Any]) -> bool:
@@ -873,49 +1042,167 @@ def fetch_indices() -> List[Dict[str, Any]]:
     return []
 
 
+SECTOR_BOARD_PAGE_SIZE = 100
+# 安全上限：total 异常时不至于无限翻页
+SECTOR_BOARD_MAX_PAGES = 20
+# 翻页排序键必须是**盘中不变**的字段。原用 f3（涨跌幅）实时排序：
+# 2026-09-28 实测同一页隔 6 秒取两次只重合 92/100，首行代码都会变。5 页串行取数
+# 期间板块在页间移动 → 有的板块被取到两次（去重后计数变少）、有的整轮漏掉。
+# 上游页大小上限是 100（pz=600 仍只回 100 行），所以只能靠固定排序键消除漂移；
+# f12（板块代码）实测两次取数 100/100 一致。
+SECTOR_BOARD_SORT_FIELD = "f12"
+SECTOR_BOARD_FIELDS = "f12,f14,f2,f3,f4,f8,f104,f105,f124"
+# 板块列表的完整性状态（与 MARKET_FETCH_STATUS 同一用途，供报告与诊断读取）
+SECTOR_BOARDS_STATUS: Dict[str, Any] = {
+    "complete": None, "provider_total": None, "expected_pages": 0,
+    "received_pages": 0, "failed_pages": [], "retrieved_rows": 0,
+    "raw_rows": 0, "duplicate_rows": 0, "blank_code_rows": 0, "missing_rows": 0,
+    "sort_field": SECTOR_BOARD_SORT_FIELD,
+}
+
+
+def _sector_board_params(page: int) -> Dict[str, Any]:
+    return {
+        "pn": page,
+        "pz": SECTOR_BOARD_PAGE_SIZE,
+        "po": 1,
+        "np": 1,
+        "fltt": 2,
+        "invt": 2,
+        "fid": SECTOR_BOARD_SORT_FIELD,
+        "fs": "m:90+t:2",
+        "fields": SECTOR_BOARD_FIELDS,
+        "ut": EASTMONEY_UT,
+    }
+
+
+def _fetch_sector_page(page: int) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+    """取一页板块原始行，并返回服务端 total。所有主机都失败时抛异常。"""
+    last_error: Optional[Exception] = None
+    for url in _rank_urls(CLIST_URLS):
+        try:
+            data = fetch_json(url, _sector_board_params(page))
+        except Exception as exc:
+            last_error = exc
+            continue
+        body = (data or {}).get("data") or {}
+        return list(body.get("diff") or []), body.get("total")
+    raise last_error or RuntimeError("板块分页取数失败")
+
+
 def fetch_sector_indices() -> List[Dict[str, Any]]:
-    """Fetch all industry board indices from East Money (行业板块)."""
+    """拉全部行业板块：按服务端 total 分页，失败页重试一次，并校验完整性。
+
+    2026-09-27 修正（同类工具调研发现）：
+    - 原实现固定最多 5 页且**不读 total**——板块数超过 500 时会被静默截断；
+    - 某页在所有主机都失败时会直接 break，悄悄返回部分板块，调用方无从察觉。
+    现在按 total 推算期望页数（带安全上限），失败页重试一次，并把「页数/行数是否符合预期」
+    写进 `SECTOR_BOARDS_STATUS` 与报告警告——不完整必须可见，不能静默。
+
+    2026-09-28 追加修正（盘中 total=496/实收 491 且无失败页）：
+    - 翻页排序键从 f3（实时涨跌幅）改为 f12（板块代码），消除页间漂移；
+    - 去重键从板块名改为板块代码——同名板块不会被互相顶掉，缺代码的行单独计数；
+    - 完整性同时记录原始行数/重复行/缺失行，警告写清差异构成，避免下次只剩
+      「实收 N」而看不出是重复、漂移还是真丢。
+    """
+    rows_by_page: Dict[int, List[Dict[str, Any]]] = {}
+    total: Optional[int] = None
+    try:
+        rows_by_page[1], total = _fetch_sector_page(1)
+    except Exception:
+        MARKET_WARNINGS.append("板块指数查询失败：首屏未取到，板块列表与板块指数区块将为空")
+        SECTOR_BOARDS_STATUS.update({
+            "complete": False, "provider_total": None, "expected_pages": 1,
+            "received_pages": 0, "failed_pages": [1], "retrieved_rows": 0,
+            "raw_rows": 0, "duplicate_rows": 0, "blank_code_rows": 0, "missing_rows": 0,
+            "sort_field": SECTOR_BOARD_SORT_FIELD,
+        })
+        return []
+
+    expected_pages = 1
+    if is_number(total) and int(total) > 0:
+        expected_pages = max(1, math.ceil(int(total) / SECTOR_BOARD_PAGE_SIZE))
+        if expected_pages > SECTOR_BOARD_MAX_PAGES:
+            MARKET_WARNINGS.append(
+                f"板块 total={int(total)} 推算需 {expected_pages} 页，超过安全上限 "
+                f"{SECTOR_BOARD_MAX_PAGES} 页；按上限取数并标记不完整"
+            )
+            expected_pages = SECTOR_BOARD_MAX_PAGES
+
+    failed_pages: List[int] = []
+    for page in range(2, expected_pages + 1):
+        try:
+            rows_by_page[page], _ = _fetch_sector_page(page)
+        except Exception:
+            failed_pages.append(page)
+    for page in list(failed_pages):     # 失败页重试一次，与全市场分页同样处理
+        try:
+            rows_by_page[page], _ = _fetch_sector_page(page)
+            failed_pages.remove(page)
+        except Exception:
+            continue
+
     all_boards: List[Dict[str, Any]] = []
-    for page in range(1, 6):  # paginate: 5 pages × 100 covers all ~500 boards
-        params = {
-            "pn": page,
-            "pz": 100,
-            "po": 1,
-            "np": 1,
-            "fltt": 2,
-            "invt": 2,
-            "fid": "f3",
-            "fs": "m:90+t:2",
-            "fields": "f12,f14,f2,f3,f4,f8,f104,f105,f124",
-            "ut": EASTMONEY_UT,
-        }
-        got_page = False
-        for url in _rank_urls(CLIST_URLS):
-            try:
-                data = fetch_json(url, params)
-                boards = ((data.get("data") or {}).get("diff") or [])
-                for b in boards:
-                    name = b.get("f14", "")
-                    if not name:
-                        continue
-                    all_boards.append({
-                        "name": name,
-                        "price": b.get("f2"),
-                        "change": b.get("f3"),
-                        "turnover": b.get("f8"),
-                        "up_count": b.get("f104"),
-                        "down_count": b.get("f105"),
-                    })
-                got_page = True
-                if len(boards) < 100:
-                    return all_boards  # last page
-                break
-            except Exception:
+    seen_codes: set = set()
+    raw_rows = 0
+    duplicate_rows = 0
+    blank_code_rows = 0
+    for page in sorted(rows_by_page):
+        for b in rows_by_page[page]:
+            raw_rows += 1
+            code = str(b.get("f12") or "").strip()
+            name = b.get("f14", "")
+            if not code:
+                # 代码是去重键，也是与自选/共振映射的键；缺代码的行不能算有效板块
+                blank_code_rows += 1
                 continue
-        if not got_page:
-            break
-    if not all_boards:
-        MARKET_WARNINGS.append("板块指数查询失败")
+            if code in seen_codes:
+                duplicate_rows += 1
+                continue
+            seen_codes.add(code)
+            all_boards.append({
+                "code": code,
+                "name": name,
+                "price": b.get("f2"),
+                "change": b.get("f3"),
+                "turnover": b.get("f8"),
+                "up_count": b.get("f104"),
+                "down_count": b.get("f105"),
+            })
+
+    provider_total = int(total) if is_number(total) else None
+    missing_rows = max(0, provider_total - len(all_boards)) if provider_total is not None else 0
+    complete = (not failed_pages) and (provider_total is None or len(all_boards) >= provider_total)
+    SECTOR_BOARDS_STATUS.update({
+        "complete": complete,
+        "provider_total": provider_total,
+        "expected_pages": expected_pages,
+        "received_pages": len(rows_by_page),
+        "failed_pages": failed_pages,
+        "retrieved_rows": len(all_boards),
+        "raw_rows": raw_rows,
+        "duplicate_rows": duplicate_rows,
+        "blank_code_rows": blank_code_rows,
+        "missing_rows": missing_rows,
+        "sort_field": SECTOR_BOARD_SORT_FIELD,
+    })
+    if not complete:
+        # 差异构成写清楚，否则下次只看到「实收 N」无法判断是漂移、重复还是真丢
+        detail: List[str] = []
+        if failed_pages:
+            detail.append(f"失败页 {sorted(failed_pages)}")
+        if missing_rows:
+            detail.append(f"较 total 少 {missing_rows} 个")
+        if duplicate_rows:
+            detail.append(f"重复行 {duplicate_rows}")
+        if blank_code_rows:
+            detail.append(f"缺板块代码 {blank_code_rows} 行")
+        MARKET_WARNINGS.append(
+            f"板块列表不完整：服务端 total={provider_total if provider_total is not None else '未知'}，"
+            f"实收 {len(all_boards)} 个板块（原始 {raw_rows} 行"
+            + (f"；{'、'.join(detail)}" if detail else "")
+            + "）；板块指数区块与双池交集的板块涨跌可能缺失，按不完整数据处理"
+        )
     return all_boards
 
 
@@ -942,33 +1229,146 @@ def collect_announcement_titles(obj: Any) -> List[str]:
     return deduped
 
 
+def _announcement_container(value: Any) -> tuple[list[Any], list[Any]] | None:
+    """Find rows while retaining the original metadata at every envelope level."""
+    return extract_primary_announcement_container(value)
+
+
+def _announcement_business_failure(value: Any) -> str | None:
+    """Reject an error envelope at any data/result nesting level."""
+    if not isinstance(value, dict):
+        return None
+    if "error" in value and value.get("error") not in (None, "", False, 0):
+        return f"error={value.get('error')!r}"
+    if "success" in value and value.get("success") not in (True, 1, "1", "true", "True", "ok", "OK"):
+        return f"success={value.get('success')!r}"
+    if "code" in value and value.get("code") not in (None, "", 0, "0", 200, "200"):
+        return f"code={value.get('code')!r}"
+    if "data" in value and value.get("data") is None:
+        return "data=null"
+    for key in ("data", "result"):
+        nested = value.get(key)
+        if isinstance(nested, dict):
+            failure = _announcement_business_failure(nested)
+            if failure:
+                return failure
+    return None
+
+
+def _has_announcement_container(value: Any) -> bool:
+    """Return whether an announcement response contains a list-shaped payload.
+
+    An HTTP 200 response is not enough evidence that Eastmoney returned a
+    valid empty list.  The endpoint has returned business-error envelopes with
+    ``data: null`` and empty objects; those must reach the CNINFO fallback.
+    """
+    return _announcement_container(value) is not None
+
+
+def _announcement_row_title(row: Any) -> str:
+    if isinstance(row, str):
+        return row.strip()
+    if not isinstance(row, dict):
+        return ""
+    for key in ("title", "announcementTitle", "noticeTitle", "notice_title", "art_title", "artTitle", "TITLE"):
+        title = str(row.get(key) or "").strip()
+        if title:
+            return title
+    return ""
+
+
+def _announcement_total(metadata_layers: Any) -> Any:
+    """Read only fields that mean total matches; ``count`` is page-local."""
+    if isinstance(metadata_layers, dict):
+        metadata_layers = [metadata_layers]
+    return extract_primary_announcement_total(metadata_layers or [])
+
+
+def _announcement_total_from_response(data: Any) -> Any:
+    if isinstance(data, dict):
+        found = _announcement_container(data)
+        return _announcement_total(found[1] if found is not None else [data])
+    return None
+
+
+def _validate_announcement_page_count(rows: List[Any], total: Any, page_size: int) -> None:
+    metadata = [] if total in (None, "") else [{"_provider_total": total}]
+    validate_primary_announcement_page(rows, metadata, page_size)
+
+
+def _validate_primary_announcement_response(data: Any, *, code: str, page_size: int) -> list[dict[str, Any]]:
+    """Validate Eastmoney's business envelope before title extraction."""
+    if isinstance(data, list):
+        rows = data
+        metadata_layers: list[Any] = []
+    else:
+        if not isinstance(data, dict):
+            raise RuntimeError("东财公告响应不是对象")
+        failure = _announcement_business_failure(data)
+        if failure:
+            raise RuntimeError(f"东财公告业务失败: {failure}")
+        found = _announcement_container(data)
+        if found is None:
+            raise RuntimeError("东财公告响应缺少公告列表容器")
+        rows, metadata_layers = found
+    validate_primary_announcement_page(rows, metadata_layers, page_size)
+    normalized: list[dict[str, Any]] = []
+    for row in rows:
+        title = _announcement_row_title(row)
+        if not title:
+            raise RuntimeError("东财公告非空页缺少可解析标题")
+        if isinstance(row, dict):
+            returned_code = str(next((row.get(key) for key in ("SECURITY_CODE", "securityCode", "stockCode", "secCode", "security_code") if row.get(key)), "")).strip()
+            if returned_code and returned_code.split(".", 1)[0].zfill(6) != str(code).zfill(6):
+                raise RuntimeError(f"东财公告返回其他证券: {returned_code}")
+            normalized.append({**row, "title": title})
+        else:
+            normalized.append({"title": title})
+    return normalized
+
+
 def fetch_announcements(code: str, page_size: int = 8) -> List[str]:
-    data = fetch_json(ANNOUNCEMENT_URL, {
-        "sr": -1,
-        "page_size": page_size,
-        "page_index": 1,
-        "ann_type": "A",
-        "client_source": "web",
-        "stock_list": code,
-    }, timeout=ANNOUNCEMENT_REQUEST_TIMEOUT_SECONDS, retries=0)
-    return collect_announcement_titles(data)[:page_size]
+    """Return announcement titles while preserving the existing risk API.
+
+    Eastmoney remains the primary source because it is already part of the
+    screening path.  A structurally valid empty response stays empty; network
+    or schema failures try CNINFO.  If both sources fail an exception is
+    raised so ``attach_announcement_risks`` keeps the last-known avoid or
+    marks the stock unknown instead of upgrading it to clean.
+    """
+    def _primary() -> Dict[str, Any]:
+        data = fetch_json(ANNOUNCEMENT_URL, {
+            "sr": -1,
+            "page_size": page_size,
+            "page_index": 1,
+            "ann_type": "A",
+            "client_source": "web",
+            "stock_list": code,
+        }, timeout=ANNOUNCEMENT_REQUEST_TIMEOUT_SECONDS, retries=0)
+        rows = _validate_primary_announcement_response(data, code=code, page_size=page_size)
+        return {
+            "rows": rows[:page_size],
+            "source_url": ANNOUNCEMENT_URL,
+            "_provider_total": _announcement_total_from_response(data),
+            "_requested_page_size": page_size,
+        }
+
+    evidence = fetch_announcement_evidence(
+        code,
+        primary=_primary,
+        fallback_factory=lambda: CNInfoAnnouncementSource(client=project_http_client()),
+        page_size=page_size,
+    )
+    if evidence.status not in {"ok", "empty"}:
+        error = evidence.error if isinstance(evidence.error, dict) else {}
+        raise RuntimeError(error.get("message") or "公告源不可用")
+    payload = evidence.data if isinstance(evidence.data, dict) else {}
+    return [str(row.get("title")) for row in (payload.get("rows") or []) if isinstance(row, dict) and row.get("title")][:page_size]
 
 
 def classify_announcement_risk(titles: List[str]) -> Dict[str, Any]:
-    filtered = [t for t in titles if not any(k in t for k in ANNOUNCEMENT_IGNORE_KEYWORDS)]
-    hard = sorted({k for t in filtered for k in HARD_ANNOUNCEMENT_KEYWORDS if k in t})
-    watch = sorted({k for t in filtered for k in WATCH_ANNOUNCEMENT_KEYWORDS if k in t})
-    if hard:
-        level = RISK_AVOID
-    elif watch:
-        level = RISK_WATCH
-    else:
-        level = RISK_CLEAN
-    return {
-        "announcement_risk": level,
-        "announcement_keywords": hard or watch,
-        "announcement_titles": filtered[:3],
-    }
+    canonical = _canonical_announcement_risk(titles)
+    return {key: canonical[key] for key in ("announcement_risk", "announcement_keywords", "announcement_titles")}
 
 
 def _load_announcement_risk_cache() -> Dict[str, Dict[str, Any]]:
@@ -985,9 +1385,9 @@ def _load_announcement_risk_cache() -> Dict[str, Dict[str, Any]]:
 
 def _save_announcement_risk_cache(cache: Dict[str, Dict[str, Any]]) -> None:
     try:
-        ANNOUNCEMENT_CACHE_FILE.write_text(
-            json.dumps(cache, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        # 原子写入：轮次被中断/进程被杀时不留下半截 JSON（读取侧会整体丢弃坏文件）。
+        state_commit.atomic_write_text(
+            ANNOUNCEMENT_CACHE_FILE, json.dumps(cache, ensure_ascii=False, indent=2)
         )
     except Exception:
         # A cache write failure must never turn a valid screening result into
@@ -1026,6 +1426,33 @@ def announcement_label(row: Dict[str, Any]) -> str:
     return risk
 
 
+# ── 公告风险政策（唯一语义，依据 选股框架.md「一、信号与建仓门禁」）──────────
+# clean：正常；watch_risk：仅减分，不阻断正式资格；avoid/unknown：一票否决。
+# 所有模块（双池交集状态机、准交集、观察池突破、资金排名、输出标签）都必须读这里，
+# 不得各自把“非 clean”当成硬否决——那是把软风险和框架一票否决混为一谈。
+RISK_HARD_VETO = frozenset({RISK_AVOID, RISK_UNKNOWN})
+
+
+def risk_blocks_formal_qualification(risk: Any) -> bool:
+    """avoid/unknown 一票否决；clean/watch_risk 不因“非 clean”被否决。"""
+    return str(risk or RISK_UNKNOWN) in RISK_HARD_VETO
+
+
+def risk_allows_state_qualification(risk: Any) -> bool:
+    """状态资格（可否推进到 ENTRY_ELIGIBLE 等）只看是否触及一票否决。"""
+    return not risk_blocks_formal_qualification(risk)
+
+
+def risk_note_text(risk: Any) -> str:
+    """人类可读风险标注：软风险与一票否决必须分开表述。"""
+    status = str(risk or RISK_UNKNOWN)
+    if status == RISK_CLEAN:
+        return ""
+    if status == RISK_WATCH:
+        return f"公告{RISK_WATCH}（仅减分，非一票否决）"
+    return f"公告风险否决({status})"
+
+
 def append_risk_text(existing: str, extra: str) -> str:
     if not extra:
         return existing
@@ -1034,6 +1461,16 @@ def append_risk_text(existing: str, extra: str) -> str:
     if extra in existing:
         return existing
     return f"{existing}/{extra}"
+
+
+# 参与公告核验的栏目：公告查询范围 = 这些栏目里出现的全部代码（去重）。
+# 不含 trend_diagnostics：那是仅供解释的近似命中行，不能把它变成一人一次请求。
+ANNOUNCEMENT_SECTIONS = (
+    "strict_ultra", "trend_observation", "strict_trend", "dual_pool",
+    "capital_rank", "dual_pool_raw", "low_ultra", "low_trend", "watchlist",
+    "pre_intersection",   # 准交集表必须与其它表读到同一份风险结果
+    "negative_super_observations",  # 负超单观察行展示的公告状态须与其它表同源
+)
 
 
 def attach_announcement_risks(
@@ -1048,11 +1485,7 @@ def attach_announcement_risks(
     # They are for explanation only, so they must not turn one checkbox into
     # one network request per near-miss stock. Check only visible/actionable
     # sections; matching diagnostic rows are annotated from this same map.
-    for section in (
-        "strict_ultra", "trend_observation", "strict_trend", "dual_pool",
-        "capital_rank", "dual_pool_raw", "low_ultra", "low_trend", "watchlist",
-        "pre_intersection",   # 准交集表必须与其它表读到同一份风险结果
-    ):
+    for section in ANNOUNCEMENT_SECTIONS:
         rows.extend(result.get(section) or [])
     codes = sorted({str(r.get("code")) for r in rows if r.get("code")})
     result["announcement_total_count"] = len(codes)
@@ -1285,42 +1718,214 @@ def _parse_sina_kline(data: Any) -> List[Dict[str, float]]:
     return rows
 
 
+def _parse_tencent_qfq_kline(data: Any, symbol: str) -> List[Dict[str, float]]:
+    """Parse Tencent's qfqday array into the screening K-line shape."""
+    body = ((data or {}).get("data") or {}).get(symbol) or {}
+    return parse_k_rows(body.get("qfqday") or [])
+
+
+# ── 腾讯日 K 失败熔断 ────────────────────────────────────────────────
+# 腾讯日 K（web.ifzq.gtimg.cn）会返回 WAF 拦截页而不是 JSON：2026-09-26 实测在代理与直连下
+# 都返回 waf.tencent.com/501page.html，同一时间腾讯实时行情（qt.gtimg.cn）正常，
+# 属于接口级拦截而非网络不通。若不做熔断，一轮 76 只候选会逐只重试并叠加多路径失败，
+# 把一次拦截放大成上百次请求。连续失败达阈值即暂停该主机一段时间，期间直接走新浪降级源。
+TENCENT_KLINE_FAIL_STREAK_LIMIT = 3
+TENCENT_KLINE_COOLDOWN_SECONDS = 600.0
+_tencent_kline_fail_streak = 0
+_tencent_kline_blocked_until = 0.0
+_sina_kline_fallback_warned = False
+
+
+def _tencent_kline_ready() -> bool:
+    return time.monotonic() >= _tencent_kline_blocked_until
+
+
+def _note_tencent_kline_result(ok: bool) -> None:
+    global _tencent_kline_fail_streak, _tencent_kline_blocked_until
+    if ok:
+        _tencent_kline_fail_streak = 0
+        _tencent_kline_blocked_until = 0.0
+        return
+    _tencent_kline_fail_streak += 1
+    if _tencent_kline_fail_streak >= TENCENT_KLINE_FAIL_STREAK_LIMIT:
+        _tencent_kline_fail_streak = 0
+        _tencent_kline_blocked_until = time.monotonic() + TENCENT_KLINE_COOLDOWN_SECONDS
+        MARKET_WARNINGS.append(
+            f"腾讯日 K 连续失败 {TENCENT_KLINE_FAIL_STREAK_LIMIT} 次，暂停 "
+            f"{int(TENCENT_KLINE_COOLDOWN_SECONDS)} 秒（实测为 WAF 拦截页，非网络不通）；"
+            "期间日 K 由新浪降级源提供，前复权口径可能不一致。"
+        )
+
+
+def _note_sina_kline_fallback() -> None:
+    """新浪降级的一次性 stderr 提示（报告内的逐轮标注见 kline_source_summary）。"""
+    global _sina_kline_fallback_warned
+    if _sina_kline_fallback_warned:
+        return
+    _sina_kline_fallback_warned = True
+    print("[kline] Sina fallback in use (unadjusted, may miss today's bar)", file=sys.stderr)
+
+
+# ── 日 K 降级：口径自检与逐轮标注 ────────────────────────────────────
+# 旧实现只在第一次落到新浪时往报告里塞一条警告（_sina_kline_fallback_warned 一次性），
+# 2026-09-28 实测：连续 15 轮走新浪、107 份报告里只有 1 份带警告，频率被严重低估。
+# 现在改为按轮汇总：每轮出报告时结算一次，并标注有多少只与前复权基准不一致。
+KLINE_MIN_BARS = 65
+# 同一交易日收盘与前复权基准的偏差上限；超过即视为复权口径不一致
+KLINE_QFQ_DEVIATION_LIMIT = 0.01
+# 前复权基准：code → (最新交易日, 收盘)。由腾讯/东财两档的成功结果维护，
+# 供降级源比对——不复权价比前复权价低 1.4%~2.7%（2026-09-28 实测），必须显式指出。
+_kline_reference: Dict[str, Tuple[str, float]] = {}
+_kline_fallback_codes: set = set()
+_kline_mismatch_codes: set = set()
+
+
+def _record_kline_reference(code: str, bars: List[Dict[str, float]]) -> None:
+    """用成功的前复权结果更新口径基准。"""
+    if bars:
+        _kline_reference[str(code)] = (str(bars[-1].get("date") or ""), float(bars[-1].get("close") or 0.0))
+
+
+def _note_sina_fallback_code(code: str, bars: List[Dict[str, float]]) -> None:
+    """登记一只走新浪降级的个股，并和基准比对日期/口径（用于逐轮标注）。"""
+    _kline_fallback_codes.add(str(code))
+    reference = _kline_reference.get(str(code))
+    if not reference or not bars:
+        return
+    ref_date, ref_close = reference
+    last = bars[-1]
+    last_date = str(last.get("date") or "")
+    last_close = float(last.get("close") or 0.0)
+    date_mismatch = bool(ref_date) and last_date != ref_date
+    deviation = abs(last_close / ref_close - 1) if ref_close else 0.0
+    if date_mismatch or deviation > KLINE_QFQ_DEVIATION_LIMIT:
+        _kline_mismatch_codes.add(str(code))
+
+
+KLINE_SOURCE_LABELS = {
+    "tencent_qfq": "腾讯前复权日K",
+    "sina_daily": "新浪日K(可能不复权)",
+    "eastmoney_qfq": "东财前复权日K",
+}
+
+
+def kline_source_summary(enriched: List[Enriched]) -> str:
+    """按本轮实际用到的日 K 来源生成报告标签，并逐轮结算降级标注。
+
+    2026-09-26 修正：原先写死“腾讯/东方财富日K”，但腾讯被 WAF 拦截时会整轮降级到新浪、
+    东财日 K 又已下线，写死的来源会与实际不符，掩盖均线口径变化。
+    2026-09-28 追加：降级警告改为**逐轮**输出（旧实现每进程只报一次，导致 15 轮降级里
+    只有 1 份报告带警告），并点名有多少只与前复权基准的日期/收盘不一致。
+    """
+    seen: List[str] = []
+    for e in enriched:
+        source = getattr(e, "k_source", "") or ""
+        if source and source not in seen:
+            seen.append(source)
+    fallback_count = len(_kline_fallback_codes)
+    if fallback_count:
+        mismatch = len(_kline_mismatch_codes)
+        detail = (
+            f"，其中 {mismatch} 只与前复权基准的日期或收盘不一致"
+            f"（偏差>{KLINE_QFQ_DEVIATION_LIMIT * 100:.0f}%；均线类判据不可比）"
+            if mismatch else ""
+        )
+        MARKET_WARNINGS.append(
+            f"日K降级：本轮 {fallback_count} 只来自新浪（不复权、可能缺当日 bar）{detail}；"
+            "均线与趋势确认池口径需按 source 字段复核，勿与本轮之外的数据直接比较。"
+        )
+    _kline_fallback_codes.clear()
+    _kline_mismatch_codes.clear()
+    if not seen:
+        return "日K来源未记录"
+    return " + ".join(KLINE_SOURCE_LABELS.get(s, s) for s in seen)
+
+
 def fetch_kline(code: str, limit: int = 90) -> Tuple[List[Dict[str, float]], str]:
-    # 1. East Money (primary, fast and reliable)
-    try:
-        data = fetch_json(EM_KLINE_URL, {
-            "secid": secid_for(code),
-            "ut": EASTMONEY_UT,
-            "fields1": "f1,f2,f3,f4,f5,f6",
-            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
-            "klt": 101,
-            "fqt": 1,
-            "end": "20500101",
-            "lmt": limit,
-        }, timeout=5, retries=1)
-        rows = (data.get("data") or {}).get("klines") or []
-        parsed = parse_k_rows(rows)
-        if len(parsed) >= min(65, limit):
+    """取前复权日 K：腾讯（主）→ 东财（备，独立厂商）→ 新浪（末档，不复权，逐轮标注）。
+
+    三档都要求根数达标；前两档成功即登记口径基准，新浪命中时与该基准比对日期与收盘，
+    不一致的个股计入 _kline_mismatch_codes，由 kline_source_summary 逐轮报出，
+    避免不复权数据静默进入均线类判据（超短池 adj_close>ma5、趋势确认池全部均线条件）。
+    """
+    min_bars = min(KLINE_MIN_BARS, limit)
+    # 1. 腾讯 qfq daily bars（主源，多主机故障转移 + 失败熔断）。
+    if _tencent_kline_ready():
+        normalized = str(code).strip().lower()
+        symbol = normalized if normalized.startswith(("sh", "sz")) else ("sh" if normalized.startswith(("6", "9")) else "sz") + normalized
+        all_hosts_failed = True
+        for url in _rank_urls(TENCENT_KLINE_URLS):
+            try:
+                data = fetch_json(url, {
+                    "param": f"{symbol},day,,,{limit},qfq",
+                }, timeout=5, retries=1)
+            except Exception:
+                _mark_host_failed(url)
+                continue
+            all_hosts_failed = False
+            try:
+                parsed = _parse_tencent_qfq_kline(data, symbol)
+            except (AttributeError, TypeError, ValueError):
+                # 上游形状异常（拦截页/结构变更）按该主机失败处理，继续下一档，不要整只崩掉
+                parsed = []
+            if len(parsed) >= min_bars:
+                _mark_host_ok(url)
+                _note_tencent_kline_result(True)
+                _record_kline_reference(code, parsed)
+                return parsed, "tencent_qfq"
+            _mark_host_failed(url)
+        # 全部主机不可达/被拦才计入熔断；主机可达但样本不足（如次新股）不算故障
+        _note_tencent_kline_result(True if not all_hosts_failed else False)
+    # 2. 东财 push2his 前复权（并列备源，与腾讯非同厂商）。列序与腾讯 qfqday 前 6 列一致，
+    #    因此共用 parse_k_rows。2026-09-25 该路径曾被断而停用，09-28 复测恢复。
+    for url in _rank_urls(EM_KLINE_URLS):
+        try:
+            data = fetch_json(url, {
+                "secid": secid_for(code),
+                "klt": 101,          # 日线
+                "fqt": 1,            # 前复权
+                "lmt": limit,
+                "end": "20500101",
+                "fields1": EM_KLINE_FIELDS1,
+                "fields2": EM_KLINE_FIELDS2,
+            }, timeout=5, retries=1)
+        except Exception:
+            _mark_host_failed(url)
+            continue
+        # 形状容错：非预期结构（列表/文案/WAF 页）按该主机失败处理，继续下沉，不要整只崩掉
+        try:
+            body = data.get("data") if isinstance(data, dict) else None
+            klines = body.get("klines") if isinstance(body, dict) else None
+            parsed = parse_k_rows(klines) if isinstance(klines, list) else []
+        except (AttributeError, TypeError, ValueError):
+            parsed = []
+        if len(parsed) >= min_bars:
+            _mark_host_ok(url)
+            _record_kline_reference(code, parsed)
             return parsed, "eastmoney_qfq"
-    except Exception:
-        pass
-    # 2. Sina (fallback, ~0.05s per request)
+        _mark_host_failed(url)
+    # 3. 新浪（末档；该端点返回不复权历史价、且可能缺当日 bar，前复权均线会出现口径跳变）。
     try:
         symbol = ("sh" if code.startswith("6") else "sz") + code
         data = fetch_json(SINA_KLINE_URL, {
             "symbol": symbol, "scale": 240, "ma": "no", "datalen": limit,
         }, timeout=5, retries=1)
         parsed = _parse_sina_kline(data)
-        if len(parsed) >= min(65, limit):
+        if len(parsed) >= min_bars:
+            _note_sina_kline_fallback()
+            _note_sina_fallback_code(code, parsed)
             return parsed, "sina_daily"
     except Exception:
         pass
     raise RuntimeError(f"all kline sources failed for {code}")
 
 
-def enrich(row: Dict[str, Any]) -> Optional[Enriched]:
+def enrich(
+    row: Dict[str, Any],
+    fetch_kline_fn: Optional[Callable[..., Tuple[List[Dict[str, float]], str]]] = None,
+) -> Optional[Enriched]:
     r = normalize_row(row)
-    rows, source = fetch_kline(r["code"], 90)
+    rows, source = (fetch_kline_fn or fetch_kline)(r["code"], 90)
     if len(rows) < 65:
         return None
     closes = [x["close"] for x in rows]
@@ -1352,6 +1957,12 @@ def enrich(row: Dict[str, Any]) -> Optional[Enriched]:
         ma20_dist=r["price"] / ma20 - 1 if ma20 else float("nan"),
         high_pull=high_pull,
         cur_to_high=r["high"] / r["price"] - 1 if r["price"] else float("nan"),
+        # 现价在当日区间的位置：0%=当日最低，100%=当日最高。只标注、不做门槛，
+        # 用于把"是不是买在半山腰"变成可见数字（2026-09-26 加入）。
+        range_pct=(
+            (r["price"] - r["low"]) / (r["high"] - r["low"]) * 100
+            if r["high"] > r["low"] else float("nan")
+        ),
         vol_vs_avg5=r["volume"] / avg(vols[-6:-1]) if avg(vols[-6:-1]) else float("nan"),
         vwap=vwap,
         vwap_state=vwap_state,
@@ -1367,7 +1978,24 @@ def enrich(row: Dict[str, Any]) -> Optional[Enriched]:
     )
 
 
-def sector_stats(rows: List[Dict[str, Any]], breadth: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, Any]]:
+def sector_stats(
+    rows: List[Dict[str, Any]],
+    breadth: Optional[Dict[str, Any]] = None,
+    boards: Any = (BOARD_MAIN,),
+) -> Dict[str, Dict[str, Any]]:
+    """行业统计。
+
+    口径（2026-09-30 起）：
+    - **行业上涨比例、平均涨幅**（``adv`` / ``sum`` / ``n``）继续用全市场 A 股背景，
+      只按行业聚合，不随交易板范围变化；
+    - **行业强势股数量**（``strong``）只统计**本轮所选交易板**内的股票，因此同行业
+      可以跨主板、创业板、科创板形成共振；默认只选主板时与历史口径逐值一致。
+    - 注意：``resonance_cfg["main_board_prefixes"]`` **不在这里使用**——它仍服务于
+      `market_summary` 的「主板涨停／跌停」统计，两个用途必须分开（否则扩大交易板
+      范围会悄悄改变"主板涨跌停"的分母）。
+    """
+    resonance_cfg = SCREENING_CONFIG["resonance"]
+    selected = set(normalize_boards(boards))
     stats: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"n": 0, "adv": 0, "strong": 0, "sum": 0.0})
     for row in rows:
         if not is_a_share_row(row) or not is_number(row.get("f3")):
@@ -1377,22 +2005,28 @@ def sector_stats(rows: List[Dict[str, Any]], breadth: Optional[Dict[str, Any]] =
         stats[sec]["sum"] += row.get("f3") or 0.0
         if row.get("f3", 0) > 0:
             stats[sec]["adv"] += 1
-        if str(row.get("f12", "")).startswith(("60", "00")) and row.get("f3", 0) >= 2.2 and row.get("f6", 0) >= 300_000_000:
+        if (
+            board_of(row.get("f12")) in selected
+            and row.get("f3", 0) >= float(resonance_cfg["strong_change_min_inclusive"])
+            and is_number(row.get("f6")) and row.get("f6") >= float(resonance_cfg["strong_amount_min_inclusive"])
+        ):
             stats[sec]["strong"] += 1
     quality = breadth or {}
     stats["__meta__"] = {
         "resonance_usable": bool(quality.get("resonance_usable", True)),
         "quality_reason": quality.get("quality_reason", ""),
+        "strong_scope_boards": list(selected),
     }
     return stats
 
 
 def has_resonance(e: Enriched, stats: Dict[str, Dict[str, Any]]) -> bool:
+    resonance_cfg = SCREENING_CONFIG["resonance"]
     meta = stats.get("__meta__") or {}
     if not meta.get("resonance_usable", True):
         return False
     sec = stats.get(e.industry) or {}
-    if sec.get("strong", 0) < 2:
+    if sec.get("strong", 0) < int(resonance_cfg["strong_candidates_min"]):
         return False
     # Also require sector-wide bullish: either ≥30% of stocks advancing,
     # or the sector's average change is positive.  This prevents a bearish
@@ -1402,24 +2036,39 @@ def has_resonance(e: Enriched, stats: Dict[str, Dict[str, Any]]) -> bool:
     adv = sec.get("adv", 0)
     avg_change = sec.get("sum", 0) / n if n > 0 else 0.0
     adv_ratio = adv / n if n > 0 else 0.0
-    return adv_ratio >= 0.3 or avg_change > 0
+    return (
+        adv_ratio >= float(resonance_cfg["advancing_ratio_min_inclusive"])
+        or avg_change > float(resonance_cfg["average_change_min_exclusive"])
+    )
 
 
 def strict_ultra(e: Enriched) -> bool:
+    cfg = SCREENING_CONFIG["strict_ultra"]
     return (
         is_number(e.volume_ratio)
-        and 5 <= e.price <= 30 and e.float_mv < 20_000_000_000 and e.turnover > 3 and e.volume_ratio > 1.2
-        and e.amount > 300_000_000 and 2 <= e.change <= 5.5 and e.adj_close > e.ma5
-        and e.five_ret <= 0.18 and e.cur_to_high <= 0.03
+        and float(cfg["price_min_inclusive"]) <= e.price <= float(cfg["price_max_inclusive"])
+        and e.float_mv < float(cfg["float_mv_max_exclusive"])
+        and e.turnover > float(cfg["turnover_min_exclusive"])
+        and e.volume_ratio > float(cfg["volume_ratio_min_exclusive"])
+        and e.amount > float(cfg["amount_min_exclusive"])
+        and float(cfg["change_min_inclusive"]) <= e.change <= float(cfg["change_max_inclusive"])
+        and e.adj_close > e.ma5
+        and e.five_ret <= float(cfg["five_ret_max_inclusive"])
+        and e.cur_to_high <= float(cfg["cur_to_high_max_inclusive"])
     )
 
 
 def strict_trend(e: Enriched) -> bool:
+    cfg = SCREENING_CONFIG["strict_trend"]
     return (
-        8 <= e.price <= 45 and 3_000_000_000 <= e.float_mv <= 25_000_000_000
+        float(cfg["price_min_inclusive"]) <= e.price <= float(cfg["price_max_inclusive"])
+        and float(cfg["float_mv_min_inclusive"]) <= e.float_mv <= float(cfg["float_mv_max_inclusive"])
         and e.price > e.ma5 and e.price > e.ma10 and e.price > e.ma20 and e.ma20 > e.prev_ma20
-        and e.dist60 <= 0.10 and 2 <= e.turnover <= 8 and e.vol_vs_avg5 <= 2
-        and 3 <= e.change <= 6.5 and e.five_ret <= 0.20
+        and e.dist60 <= float(cfg["dist60_max_inclusive"])
+        and float(cfg["turnover_min_inclusive"]) <= e.turnover <= float(cfg["turnover_max_inclusive"])
+        and e.vol_vs_avg5 <= float(cfg["vol_vs_avg5_max_inclusive"])
+        and float(cfg["change_min_inclusive"]) <= e.change <= float(cfg["change_max_inclusive"])
+        and e.five_ret <= float(cfg["five_ret_max_inclusive"])
     )
 
 
@@ -1430,27 +2079,33 @@ def trend_confirm_relaxed(e: Enriched) -> bool:
     错误排除哈药(~5.8)等低价强势股。交集状态机用此判定"正式交集"，与
     strict_trend 相比只去掉价格区间、流通市值两项。
     """
+    cfg = SCREENING_CONFIG["strict_trend"]
     return (
         e.price > e.ma5 and e.price > e.ma10 and e.price > e.ma20
         and e.ma20 > e.prev_ma20
-        and 3 <= e.change <= 6.5 and e.five_ret <= 0.20 and e.dist60 <= 0.10
-        and 2 <= e.turnover <= 8 and e.amount > 300_000_000 and e.vol_vs_avg5 <= 2
+        and float(cfg["change_min_inclusive"]) <= e.change <= float(cfg["change_max_inclusive"])
+        and e.five_ret <= float(cfg["five_ret_max_inclusive"])
+        and e.dist60 <= float(cfg["dist60_max_inclusive"])
+        and float(cfg["turnover_min_inclusive"]) <= e.turnover <= float(cfg["turnover_max_inclusive"])
+        and e.amount > float(cfg["amount_min_exclusive"])
+        and e.vol_vs_avg5 <= float(cfg["vol_vs_avg5_max_inclusive"])
     )
 
 
 def _trend_quality_checks(e: Enriched) -> List[tuple]:
     """趋势质量条件清单（不含价格区间/流通市值），供准交集"差一项"判定。"""
+    cfg = SCREENING_CONFIG["strict_trend"]
     return [
         ("价格相对MA5", e.price > e.ma5),
         ("价格相对MA10", e.price > e.ma10),
         ("价格相对MA20", e.price > e.ma20),
         ("MA20斜率", e.ma20 > e.prev_ma20),
-        ("当日涨幅", 3 <= e.change <= 6.5),
-        ("5日涨幅", e.five_ret <= 0.20),
-        ("距60日高点", e.dist60 <= 0.10),
-        ("换手率", 2 <= e.turnover <= 8),
-        ("成交额", e.amount > 300_000_000),
-        ("量能相对5日", e.vol_vs_avg5 <= 2),
+        ("当日涨幅", float(cfg["change_min_inclusive"]) <= e.change <= float(cfg["change_max_inclusive"])),
+        ("5日涨幅", e.five_ret <= float(cfg["five_ret_max_inclusive"])),
+        ("距60日高点", e.dist60 <= float(cfg["dist60_max_inclusive"])),
+        ("换手率", float(cfg["turnover_min_inclusive"]) <= e.turnover <= float(cfg["turnover_max_inclusive"])),
+        ("成交额", e.amount > float(cfg["amount_min_exclusive"])),
+        ("量能相对5日", e.vol_vs_avg5 <= float(cfg["vol_vs_avg5_max_inclusive"])),
     ]
 
 
@@ -1465,51 +2120,64 @@ def trend_observation(e: Enriched) -> bool:
     """
     if strict_trend(e):
         return True
+    cfg = SCREENING_CONFIG["trend_observation"]
     return (
-        8 <= e.price <= 45
-        and 3_000_000_000 <= e.float_mv <= 25_000_000_000
-        and e.amount > 300_000_000
+        float(cfg["price_min_inclusive"]) <= e.price <= float(cfg["price_max_inclusive"])
+        and float(cfg["float_mv_min_inclusive"]) <= e.float_mv <= float(cfg["float_mv_max_inclusive"])
+        and e.amount > float(cfg["amount_min_exclusive"])
         and e.price >= e.ma20
         and e.ma20 > e.prev_ma20
-        and e.price >= e.ma5 * 0.985
-        and e.ma5 >= e.ma10 * 0.985
-        and -1 <= e.change <= 4.5
-        and 1.5 <= e.turnover <= 10
-        and e.vol_vs_avg5 <= 2.5
-        and e.five_ret <= 0.20
-        and e.dist60 <= 0.15
+        and e.price >= e.ma5 * float(cfg["price_ma5_min_multiplier"])
+        and e.ma5 >= e.ma10 * float(cfg["ma5_ma10_min_multiplier"])
+        and float(cfg["change_min_inclusive"]) <= e.change <= float(cfg["change_max_inclusive"])
+        and float(cfg["turnover_min_inclusive"]) <= e.turnover <= float(cfg["turnover_max_inclusive"])
+        and e.vol_vs_avg5 <= float(cfg["vol_vs_avg5_max_inclusive"])
+        and e.five_ret <= float(cfg["five_ret_max_inclusive"])
+        and e.dist60 <= float(cfg["dist60_max_inclusive"])
     )
 
 
 def trend_condition_diagnosis(e: Enriched, stats: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
     """Explain every strict confirmation condition for an ultra candidate."""
+    strict_cfg = SCREENING_CONFIG["strict_trend"]
+    observation_cfg = SCREENING_CONFIG["trend_observation"]
     checks = [
-        ("价格区间", 8 <= e.price <= 45),
-        ("流通市值", 3_000_000_000 <= e.float_mv <= 25_000_000_000),
+        ("价格区间", float(strict_cfg["price_min_inclusive"]) <= e.price <= float(strict_cfg["price_max_inclusive"])),
+        ("流通市值", float(strict_cfg["float_mv_min_inclusive"]) <= e.float_mv <= float(strict_cfg["float_mv_max_inclusive"])),
         ("价格相对MA5", e.price > e.ma5),
         ("价格相对MA10", e.price > e.ma10),
         ("价格相对MA20", e.price > e.ma20),
         ("MA20斜率", e.ma20 > e.prev_ma20),
-        ("当日涨幅", 3 <= e.change <= 6.5),
-        ("5日涨幅", e.five_ret <= 0.20),
-        ("距60日高点", e.dist60 <= 0.10),
-        ("换手率", 2 <= e.turnover <= 8),
-        ("成交额", e.amount > 300_000_000),
-        ("量能相对5日", e.vol_vs_avg5 <= 2),
+        ("当日涨幅", float(strict_cfg["change_min_inclusive"]) <= e.change <= float(strict_cfg["change_max_inclusive"])),
+        ("5日涨幅", e.five_ret <= float(strict_cfg["five_ret_max_inclusive"])),
+        ("距60日高点", e.dist60 <= float(strict_cfg["dist60_max_inclusive"])),
+        ("换手率", float(strict_cfg["turnover_min_inclusive"]) <= e.turnover <= float(strict_cfg["turnover_max_inclusive"])),
+        ("成交额", e.amount > float(strict_cfg["amount_min_exclusive"])),
+        ("量能相对5日", e.vol_vs_avg5 <= float(strict_cfg["vol_vs_avg5_max_inclusive"])),
     ]
     failures = [name for name, passed in checks if not passed]
     observation_checks = [
-        ("价格区间", 8 <= e.price <= 45),
-        ("流通市值", 3_000_000_000 <= e.float_mv <= 25_000_000_000),
-        ("成交额", e.amount > 300_000_000),
+        ("价格区间", float(observation_cfg["price_min_inclusive"]) <= e.price <= float(observation_cfg["price_max_inclusive"])),
+        ("流通市值", float(observation_cfg["float_mv_min_inclusive"]) <= e.float_mv <= float(observation_cfg["float_mv_max_inclusive"])),
+        ("成交额", e.amount > float(observation_cfg["amount_min_exclusive"])),
         ("价格相对MA20", e.price >= e.ma20),
         ("MA20斜率", e.ma20 > e.prev_ma20),
-        ("MA5/MA10未明显转弱", e.price >= e.ma5 * 0.985 and e.ma5 >= e.ma10 * 0.985),
-        ("当日涨幅", -1 <= e.change <= 4.5),
-        ("换手率", 1.5 <= e.turnover <= 10),
-        ("量能相对5日", e.vol_vs_avg5 <= 2.5),
-        ("5日涨幅", e.five_ret <= 0.20),
-        ("距60日高点", e.dist60 <= 0.15),
+        (
+            "MA5/MA10未明显转弱",
+            e.price >= e.ma5 * float(observation_cfg["price_ma5_min_multiplier"])
+            and e.ma5 >= e.ma10 * float(observation_cfg["ma5_ma10_min_multiplier"]),
+        ),
+        (
+            "当日涨幅",
+            float(observation_cfg["change_min_inclusive"]) <= e.change <= float(observation_cfg["change_max_inclusive"]),
+        ),
+        (
+            "换手率",
+            float(observation_cfg["turnover_min_inclusive"]) <= e.turnover <= float(observation_cfg["turnover_max_inclusive"]),
+        ),
+        ("量能相对5日", e.vol_vs_avg5 <= float(observation_cfg["vol_vs_avg5_max_inclusive"])),
+        ("5日涨幅", e.five_ret <= float(observation_cfg["five_ret_max_inclusive"])),
+        ("距60日高点", e.dist60 <= float(observation_cfg["dist60_max_inclusive"])),
     ]
     observation_failures = [name for name, passed in observation_checks if not passed]
     # Strict confirmation is explicitly an upgrade of observation.  Keep that
@@ -1545,78 +2213,179 @@ def trend_condition_diagnosis(e: Enriched, stats: Optional[Dict[str, Dict[str, A
 
 
 def low_ultra_class(e: Enriched, stats: Dict[str, Dict[str, Any]], after_1420: bool) -> Tuple[str, List[str], float]:
+    cfg = SCREENING_CONFIG["low_ultra"]
+    resonance = has_resonance(e, stats)
     tags: List[str] = []
-    if e.high_pull <= 0.3:
+    if e.high_pull <= float(cfg["tag_high_pull_max_inclusive"]):
         tags.append("追高风险")
-    if e.high_pull > 1.5:
+    if e.high_pull > float(cfg["tag_high_pull_risk_max_exclusive"]):
         tags.append("冲高回落风险")
-    if e.change > 4.8 and after_1420:
+    if e.change > float(cfg["tag_tail_change_min_exclusive"]) and after_1420:
         tags.append("尾盘追高风险")
-    if e.turnover > 10 and e.amount > 1_200_000_000 and e.change < 3:
+    if (
+        e.turnover > float(cfg["stagnation_turnover_min_exclusive"])
+        and e.amount > float(cfg["stagnation_amount_min_exclusive"])
+        and e.change < float(cfg["stagnation_change_max_exclusive"])
+    ):
         tags.append("巨量滞涨")
     if e.vwap_state == "均价线下方":
         tags.append("均价线下方")
-    if not has_resonance(e, stats):
+    if not resonance:
         tags.append("板块共振不足")
-    hard_c = e.change > 5.2 or e.turnover > 10 or e.volume_ratio > 6 or "巨量滞涨" in tags or e.vwap_state == "均价线下方"
+    hard_c = (
+        e.change > float(cfg["hard_change_max_exclusive"])
+        or e.turnover > float(cfg["hard_turnover_max_exclusive"])
+        or e.volume_ratio > float(cfg["hard_volume_ratio_max_exclusive"])
+        or "巨量滞涨" in tags
+        or e.vwap_state == "均价线下方"
+    )
     if hard_c:
         cls = "C"
-    elif 2.2 <= e.change <= 4.6 and 2.5 <= e.turnover <= 8 and 1.2 <= e.volume_ratio <= 3.8 and e.amount > 300_000_000 and e.price > e.ma5 and e.high_pull <= 1.5 and e.vwap_state == "均价线上方" and has_resonance(e, stats):
+    elif (
+        float(cfg["a_change_min_inclusive"]) <= e.change <= float(cfg["a_change_max_inclusive"])
+        and float(cfg["a_turnover_min_inclusive"]) <= e.turnover <= float(cfg["a_turnover_max_inclusive"])
+        and float(cfg["a_volume_ratio_min_inclusive"]) <= e.volume_ratio <= float(cfg["a_volume_ratio_max_inclusive"])
+        and e.amount > float(cfg["a_amount_min_exclusive"])
+        and e.price > e.ma5
+        and e.high_pull <= float(cfg["a_high_pull_max_inclusive"])
+        and e.vwap_state == "均价线上方"
+        and resonance
+    ):
         cls = "A"
-    elif 2.2 <= e.change <= 5.2 and e.turnover <= 10 and e.volume_ratio <= 6 and e.price > e.ma5:
+    elif (
+        float(cfg["b_change_min_inclusive"]) <= e.change <= float(cfg["b_change_max_inclusive"])
+        and e.turnover <= float(cfg["b_turnover_max_inclusive"])
+        and e.volume_ratio <= float(cfg["b_volume_ratio_max_inclusive"])
+        and e.price > e.ma5
+    ):
         cls = "B"
     else:
         cls = "C"
     score = 0.0
-    score += max(0, 25 - abs(e.change - 3.4) * 8)
-    score += max(0, 20 - abs(e.turnover - 5.0) * 3)
-    score += 15 if 400_000_000 <= e.amount <= 1_200_000_000 else 8
-    score += 15 if e.vwap_state == "均价线上方" else 0
-    score += 15 if e.high_pull <= 1.5 else 4
-    score += 10 if has_resonance(e, stats) else 0
-    score += 10 if e.price > e.ma5 and e.price / e.ma5 - 1 <= 0.035 else 4
+    score += max(0, float(cfg["score_change_max"]) - abs(e.change - float(cfg["score_change_target"])) * float(cfg["score_change_scale"]))
+    score += max(0, float(cfg["score_turnover_max"]) - abs(e.turnover - float(cfg["score_turnover_target"])) * float(cfg["score_turnover_scale"]))
+    score += float(cfg["score_amount_good_points"]) if float(cfg["score_amount_good_min_inclusive"]) <= e.amount <= float(cfg["score_amount_good_max_inclusive"]) else float(cfg["score_amount_other_points"])
+    score += float(cfg["score_vwap_points"]) if e.vwap_state == "均价线上方" else 0
+    score += float(cfg["score_high_pull_good_points"]) if e.high_pull <= float(cfg["score_high_pull_good_max_inclusive"]) else float(cfg["score_high_pull_other_points"])
+    score += float(cfg["score_resonance_points"]) if resonance else 0
+    score += float(cfg["score_ma5_good_points"]) if e.price > e.ma5 and e.price / e.ma5 - 1 <= float(cfg["score_ma5_distance_max_inclusive"]) else float(cfg["score_ma5_other_points"])
     return cls, tags, round(score, 1)
 
 
 def low_trend_class(e: Enriched, stats: Dict[str, Dict[str, Any]], after_1420: bool) -> Tuple[str, List[str], float]:
+    cfg = SCREENING_CONFIG["low_trend"]
+    resonance = has_resonance(e, stats)
     tags: List[str] = []
-    if e.change > 6:
+    if e.change > float(cfg["tag_hold_change_min_exclusive"]):
         tags.append("持仓区/止盈区")
-    elif e.change > 5.2:
+    elif e.change > float(cfg["tag_observation_change_min_exclusive"]):
         tags.append("趋势观察池")
-    if e.high_pull <= 0.3:
+    if e.high_pull <= float(cfg["tag_high_pull_max_inclusive"]):
         tags.append("追高风险")
-    if after_1420 and e.change > 4.8:
+    if after_1420 and e.change > float(cfg["tag_tail_change_min_exclusive"]):
         tags.append("尾盘追高风险")
     if e.vwap_state == "均价线下方":
         tags.append("放量滞涨风险")
-    if not has_resonance(e, stats):
+    if not resonance:
         tags.append("板块共振不足")
-    base = e.price > e.ma5 and e.price > e.ma10 and e.price > e.ma20 and e.ma5 > e.prev_ma5 and e.ma10 >= e.prev_ma10 and e.amount > 300_000_000
-    hard_c = e.change > 6 or e.turnover > 9 or e.ma20_dist > 0.15 or e.five_ret > 0.18
+    base = (
+        e.price > e.ma5 and e.price > e.ma10 and e.price > e.ma20
+        and e.ma5 > e.prev_ma5 and e.ma10 >= e.prev_ma10
+        and e.amount > float(cfg["base_amount_min_exclusive"])
+    )
+    hard_c = (
+        e.change > float(cfg["hard_change_max_exclusive"])
+        or e.turnover > float(cfg["hard_turnover_max_exclusive"])
+        or e.ma20_dist > float(cfg["hard_ma20_dist_max_exclusive"])
+        or e.five_ret > float(cfg["hard_five_ret_max_inclusive"])
+    )
     if hard_c:
         cls = "C"
-    elif base and 2.5 <= e.change <= 5.2 and 2 <= e.turnover <= 7.5 and e.high_pull > 0.3 and "尾盘追高风险" not in tags and has_resonance(e, stats):
+    elif (
+        base
+        and float(cfg["a_change_min_inclusive"]) <= e.change <= float(cfg["a_change_max_inclusive"])
+        and float(cfg["a_turnover_min_inclusive"]) <= e.turnover <= float(cfg["a_turnover_max_inclusive"])
+        and e.high_pull > float(cfg["a_high_pull_min_exclusive"])
+        and "尾盘追高风险" not in tags
+        and resonance
+    ):
         cls = "A"
-    elif base and 2.5 <= e.change <= 6 and e.turnover <= 9:
+    elif (
+        base
+        and float(cfg["b_change_min_inclusive"]) <= e.change <= float(cfg["b_change_max_inclusive"])
+        and e.turnover <= float(cfg["b_turnover_max_inclusive"])
+    ):
         cls = "B"
     else:
         cls = "C"
     score = 0.0
-    score += max(0, 25 - abs(e.change - 3.8) * 7)
-    score += 20 if 2 <= e.turnover <= 7.5 else 6
-    score += 15 if 400_000_000 <= e.amount <= 1_500_000_000 else 8
-    score += 15 if e.ma5 > e.prev_ma5 and e.ma10 >= e.prev_ma10 else 3
-    score += max(0, 15 - e.ma20_dist * 100)
-    score += 10 if has_resonance(e, stats) else 0
-    score += 10 if e.high_pull <= 1.5 else 4
+    score += max(0, float(cfg["score_change_max"]) - abs(e.change - float(cfg["score_change_target"])) * float(cfg["score_change_scale"]))
+    score += float(cfg["score_turnover_good_points"]) if float(cfg["score_turnover_min_inclusive"]) <= e.turnover <= float(cfg["score_turnover_max_inclusive"]) else float(cfg["score_turnover_other_points"])
+    score += float(cfg["score_amount_good_points"]) if float(cfg["score_amount_good_min_inclusive"]) <= e.amount <= float(cfg["score_amount_good_max_inclusive"]) else float(cfg["score_amount_other_points"])
+    score += float(cfg["score_slope_good_points"]) if e.ma5 > e.prev_ma5 and e.ma10 >= e.prev_ma10 else float(cfg["score_slope_other_points"])
+    score += max(0, float(cfg["score_ma20_max_points"]) - e.ma20_dist * float(cfg["score_ma20_scale"]))
+    score += float(cfg["score_resonance_points"]) if resonance else 0
+    score += float(cfg["score_high_pull_good_points"]) if e.high_pull <= float(cfg["score_high_pull_good_max_inclusive"]) else float(cfg["score_high_pull_other_points"])
     return cls, tags, round(score, 1)
+
+
+def low_ultra_output_eligible(e: Enriched, cls: str) -> bool:
+    """低吸超短报表保留条件，供 CLI 与实时引擎共用。"""
+    cfg = SCREENING_CONFIG["low_ultra"]
+    return cls != "C" or (
+        e.change >= float(cfg["output_change_min_inclusive"])
+        and (
+            e.turnover > float(cfg["hard_turnover_max_exclusive"])
+            or e.change > float(cfg["hard_change_max_exclusive"])
+            or e.volume_ratio > float(cfg["hard_volume_ratio_max_exclusive"])
+        )
+    )
+
+
+def low_trend_output_eligible(e: Enriched, cls: str) -> bool:
+    """低吸趋势报表保留条件，供 CLI 与实时引擎共用。"""
+    cfg = SCREENING_CONFIG["low_trend"]
+    return cls != "C" or (
+        e.change >= float(cfg["output_change_min_inclusive"])
+        and (
+            e.change > float(cfg["hard_change_max_exclusive"])
+            or e.turnover > float(cfg["hard_turnover_max_exclusive"])
+            or e.ma20_dist > float(cfg["hard_ma20_dist_max_exclusive"])
+        )
+    )
+
+
+def low_ultra_sort_key(row: Dict[str, Any]) -> Tuple[Any, ...]:
+    cfg = SCREENING_CONFIG["low_ultra"]
+    return (
+        {"A": 0, "B": 1, "C": 2}.get(row["class"], 99),
+        -row["score"],
+        abs(row["change"] - float(cfg["score_change_target"])),
+    )
+
+
+def low_trend_sort_key(row: Dict[str, Any]) -> Tuple[Any, ...]:
+    cfg = SCREENING_CONFIG["low_trend"]
+    return (
+        {"A": 0, "B": 1, "C": 2}.get(row["class"], 99),
+        -row["score"],
+        abs(row["change"] - float(cfg["score_change_target"])),
+    )
+
+
+def is_after_tail_risk(timestamp: datetime) -> bool:
+    """判断是否进入执行配置登记的尾盘风控时段。"""
+    start = EXECUTION_CONFIG["time_windows"]["tail_risk"]["start"]
+    return timestamp.hour * 60 + timestamp.minute >= hhmm_to_minutes(start)
 
 
 def _should_exclude_from_low_absorb(
     e: "Enriched", flow_history: Dict[str, List[Dict[str, Any]]]
 ) -> Tuple[bool, str]:
-    """框架教训落地：硬黑名单 + 高位派发降权。返回 (是否排除, 原因)。"""
+    """框架教训落地：硬黑名单 + 高位派发降权。返回 (是否排除, 原因)。
+
+    进入筛选轮时（round_series_date 已设置）快照不足会用东财分钟序列核验；否则只按快照判断。
+    """
     exclusion_cfg = RISK_CONFIG["low_absorb_exclusion"]
     # 硬黑名单：框架明确记载的教训案例
     if e.code in HARD_BLACKLIST:
@@ -1626,15 +2395,27 @@ def _should_exclude_from_low_absorb(
         e.five_ret >= float(exclusion_cfg["five_day_return_min_ratio"])
         and e.main_pct <= float(exclusion_cfg["main_pct_max_inclusive"])
     ):
-        hist = (flow_history or {}).get(e.code) or []
         lookback = int(exclusion_cfg["history_lookback_snapshots"])
-        neg_count = sum(
-            1 for h in hist[-lookback:] if h.get("main_net", 0) <= 0
-        )
-        if neg_count >= int(exclusion_cfg["negative_main_snapshots_min"]):
+        need = int(exclusion_cfg["negative_main_snapshots_min"])
+        hist = (flow_history or {}).get(e.code) or []
+        if len(hist) >= lookback:
+            neg_count = sum(1 for h in hist[-lookback:] if h.get("main_net", 0) <= 0)
+        else:
+            # 2026-09-26：快照不足时用分钟序列等间隔采样核验（口径对齐：数累计值是否为负）；
+            # 仍无法核验则只记数，不改变"不排除"的既有行为，并在报告里提示待核验。
+            neg_count = None
+            date = round_series_date()
+            if date:
+                neg_count = flow_negative_samples_from_minutes(
+                    _flow_minute_series_for(e.code, date), lookback
+                )
+            if neg_count is None:
+                _note_low_absorb_unverified()
+                return False, ""
+        if neg_count >= need:
             return True, (
                 f"高位派发降权：5日涨{e.five_ret*100:.1f}%+"
-                f"近{len(hist[-lookback:])}次快照{neg_count}次主力净流出"
+                f"近{lookback}期{neg_count}期主力净额≤0"
             )
     return False, ""
 
@@ -1654,7 +2435,8 @@ def _qualifies_low_open_wash(e: "Enriched", flow_history) -> bool:
     if not (is_number(e.open) and is_number(e.prev_close) and is_number(e.price)
             and e.main_net is not None and e.main_net == e.main_net):
         return False
-    if not (e.open <= e.prev_close * 0.98):
+    wash_cfg = SCREENING_CONFIG["low_open_wash"]
+    if not (e.open <= e.prev_close * float(wash_cfg["open_max_prev_close_multiplier"])):
         return False
     if not (e.price > e.open):
         return False
@@ -1692,7 +2474,8 @@ def market_summary(
     a_share_rows = [r for r in rows if is_a_share_row(r)]
     valid_change = [r for r in a_share_rows if is_number(r.get("f3"))]
     invalid_change = len(a_share_rows) - len(valid_change)
-    main = [r for r in valid_change if str(r.get("f12", "")).startswith(("60", "00"))]
+    main_board_prefixes = tuple(str(prefix) for prefix in SCREENING_CONFIG["resonance"]["main_board_prefixes"])
+    main = [r for r in valid_change if str(r.get("f12", "")).startswith(main_board_prefixes)]
     adv = sum(1 for r in valid_change if r["f3"] > 0)
     dec = sum(1 for r in valid_change if r["f3"] < 0)
     flat = sum(1 for r in valid_change if r["f3"] == 0)
@@ -1712,8 +2495,14 @@ def market_summary(
         )
     if not provider_complete and not fallback_source:
         quality_reasons.append(f"服务端总数{provider_total}，本次仅取得{len(rows)}条")
-    if a_share_rows and invalid_change / len(a_share_rows) > 0.10:
-        quality_reasons.append(f"A股涨跌幅缺失{invalid_change}条，超过10%")
+    snapshot_cfg = SCREENING_CONFIG["market_snapshot"]
+    if (
+        a_share_rows
+        and invalid_change / len(a_share_rows) > float(snapshot_cfg["invalid_change_ratio_max_exclusive"])
+    ):
+        quality_reasons.append(
+            f"A股涨跌幅缺失{invalid_change}条，超过{float(snapshot_cfg['invalid_change_ratio_max_exclusive'])*100:g}%"
+        )
     if valid_change and dec == 0:
         quality_reasons.append("下跌数为0，疑似仅取得涨幅排序的部分样本")
     degraded = bool(quality_reasons)
@@ -1727,16 +2516,31 @@ def market_summary(
         "valid_change": len(valid_change),
         "invalid_change": invalid_change,
         "breadth": adv / len(valid_change) if valid_change else None,
-        "main_limit_up": sum(1 for r in main if r["f3"] >= 9.8),
-        "main_limit_down": sum(1 for r in main if r["f3"] <= -9.8),
+        "main_limit_up": sum(1 for r in main if r["f3"] >= float(snapshot_cfg["limit_up_change_min_inclusive"])),
+        "main_limit_down": sum(1 for r in main if r["f3"] <= float(snapshot_cfg["limit_down_change_max_inclusive"])),
         "degraded": degraded,
         "resonance_usable": not degraded,
         "quality_reason": "；".join(quality_reasons),
     }
 
 
-def filter_prefetch(rows: List[Dict[str, Any]], modes: List[str]) -> List[Dict[str, Any]]:
-    valid = [r for r in rows if valid_main_board(r)]
+def filter_prefetch(
+    rows: List[Dict[str, Any]],
+    modes: List[str],
+    boards: Any = (BOARD_MAIN,),
+) -> List[Dict[str, Any]]:
+    """按模块与交易板预筛候选。
+
+    ``boards`` 默认只含沪深主板，因此默认输出与历史基线逐行一致。所选的创业板／
+    科创板行与主板行**同样进入正式链路**（资金增量与状态 → 超短池／趋势池 →
+    双池交集 → 资金优选／低吸／明日观察池 → 状态机），使用同一套门槛与排名：
+    本文只负责按范围放行，不放宽也不收紧任何策略条件。未选的交易板在这里就被
+    挡掉，正式池因此不会混入未选交易板的股票。
+    """
+    ultra_cfg = SCREENING_CONFIG["strict_ultra"]
+    trend_cfg = SCREENING_CONFIG["strict_trend"]
+    observation_cfg = SCREENING_CONFIG["trend_observation"]
+    valid = [r for r in rows if valid_board_row(r, boards)]
     has_all = "all" in modes
     has_strict = has_all or "strict" in modes
     has_low = has_all or "low" in modes
@@ -1748,33 +2552,50 @@ def filter_prefetch(rows: List[Dict[str, Any]], modes: List[str]) -> List[Dict[s
         chg = r["f3"]
         if has_strict:
             ultra_prefilter = (
-                5 <= price <= 30 and r["f21"] < 20_000_000_000 and r["f8"] > 3
-                and is_number(r.get("f10")) and r["f10"] > 1.2
-                and amount > 300_000_000 and 2 <= chg <= 5.5
+                float(ultra_cfg["price_min_inclusive"]) <= price <= float(ultra_cfg["price_max_inclusive"])
+                and r["f21"] < float(ultra_cfg["float_mv_max_exclusive"])
+                and r["f8"] > float(ultra_cfg["turnover_min_exclusive"])
+                and is_number(r.get("f10")) and r["f10"] > float(ultra_cfg["volume_ratio_min_exclusive"])
+                and amount > float(ultra_cfg["amount_min_exclusive"])
+                and float(ultra_cfg["change_min_inclusive"]) <= chg <= float(ultra_cfg["change_max_inclusive"])
             )
             confirmation_prefilter = (
-                8 <= price <= 45 and 3_000_000_000 <= r["f21"] <= 25_000_000_000
-                and 2 <= r["f8"] <= 8 and 3 <= chg <= 6.5
+                float(trend_cfg["price_min_inclusive"]) <= price <= float(trend_cfg["price_max_inclusive"])
+                and float(trend_cfg["float_mv_min_inclusive"]) <= r["f21"] <= float(trend_cfg["float_mv_max_inclusive"])
+                and float(trend_cfg["turnover_min_inclusive"]) <= r["f8"] <= float(trend_cfg["turnover_max_inclusive"])
+                and float(trend_cfg["change_min_inclusive"]) <= chg <= float(trend_cfg["change_max_inclusive"])
             )
             observation_prefilter = (
-                8 <= price <= 45 and 3_000_000_000 <= r["f21"] <= 25_000_000_000
-                and amount > 300_000_000 and 1.5 <= r["f8"] <= 10 and -1 <= chg <= 4.5
+                float(observation_cfg["price_min_inclusive"]) <= price <= float(observation_cfg["price_max_inclusive"])
+                and float(observation_cfg["float_mv_min_inclusive"]) <= r["f21"] <= float(observation_cfg["float_mv_max_inclusive"])
+                and amount > float(observation_cfg["amount_min_exclusive"])
+                and float(observation_cfg["turnover_min_inclusive"]) <= r["f8"] <= float(observation_cfg["turnover_max_inclusive"])
+                and float(observation_cfg["change_min_inclusive"]) <= chg <= float(observation_cfg["change_max_inclusive"])
             )
             if ultra_prefilter or confirmation_prefilter or observation_prefilter:
                 selected.append(r)
                 continue
         if has_low or has_wl:
-            if 5 <= price <= 45 and amount > 300_000_000 and 1.0 <= chg <= 6.5:
+            if (
+                float(ultra_cfg["price_min_inclusive"]) <= price <= float(SCREENING_CONFIG["watchlist"]["price_max_inclusive"])
+                and amount > float(ultra_cfg["amount_min_exclusive"])
+                and float(SCREENING_CONFIG["low_absorb"]["prefetch_change_min_inclusive"]) <= chg
+                <= float(SCREENING_CONFIG["low_absorb"]["prefetch_change_max_inclusive"])
+            ):
                 selected.append(r)
     dedup = {r["f12"]: r for r in selected}
     return list(dedup.values())
 
 
-def enrich_all(rows: List[Dict[str, Any]], workers: int) -> Tuple[List[Enriched], List[str]]:
+def enrich_all(
+    rows: List[Dict[str, Any]],
+    workers: int,
+    fetch_kline_fn: Optional[Callable[..., Tuple[List[Dict[str, float]], str]]] = None,
+) -> Tuple[List[Enriched], List[str]]:
     out: List[Enriched] = []
     errors: List[str] = []
     with futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        future_map = {pool.submit(enrich, r): str(r.get("f12")) for r in rows}
+        future_map = {pool.submit(enrich, r, fetch_kline_fn): str(r.get("f12")) for r in rows}
         for fut in futures.as_completed(future_map):
             code = future_map[fut]
             try:
@@ -1790,7 +2611,7 @@ def enrich_all(rows: List[Dict[str, Any]], workers: int) -> Tuple[List[Enriched]
 
 # ── snapshot & flow classification ──────────────────────────────────────
 
-FLOW_SNAPSHOT_PATH = Path(__file__).resolve().parent / "flow_snapshot.json"
+FLOW_SNAPSHOT_PATH = runtime_paths.state_file("flow_snapshot.json")
 
 
 def load_flow_history() -> Dict[str, List[Dict[str, Any]]]:
@@ -1810,12 +2631,19 @@ def load_flow_history() -> Dict[str, List[Dict[str, Any]]]:
     return {}
 
 
-def save_flow_history(enriched: List[Enriched], history: Dict[str, List[Dict[str, Any]]]) -> None:
-    """Save current query's capital flow data, appending to history. Keep last 30 minutes."""
+def save_flow_history(
+    enriched: List[Enriched],
+    history: Dict[str, List[Dict[str, Any]]],
+    commit: Optional[state_commit.RoundCommit] = None,
+) -> None:
+    """Save current query's capital flow data, appending to history. Keep last 30 minutes.
+
+    ``commit`` 非空时只暂存（超时轮会被丢弃），为空时立即原子落盘（CLI/单测行为）。
+    """
     import time as _t
     now = _t.time()
-    cutoff = now - 1800  # 30 minutes
-    entry = {"ts": now}
+    flow_cfg = SCREENING_CONFIG["flow"]
+    cutoff = now - float(flow_cfg["history_retention_seconds"])
     for e in enriched:
         if e.code not in history:
             history[e.code] = []
@@ -1833,10 +2661,9 @@ def save_flow_history(enriched: List[Enriched], history: Dict[str, List[Dict[str
         # Also remove the placeholder entry we added at the start
     # Remove codes with no valid entries
     history = {k: v for k, v in history.items() if v}
-    try:
-        FLOW_SNAPSHOT_PATH.write_text(json.dumps(history, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
+    state_commit.write_or_stage(
+        commit, FLOW_SNAPSHOT_PATH, json.dumps(history, ensure_ascii=False)
+    )
 
 
 def apply_flow_increments(enriched: List[Enriched], history: Dict[str, List[Dict[str, Any]]]) -> None:
@@ -1848,11 +2675,17 @@ def apply_flow_increments(enriched: List[Enriched], history: Dict[str, List[Dict
     """
     import time as _t
     now = _t.time()
+    flow_cfg = SCREENING_CONFIG["flow"]
+    baseline_5m_cfg = flow_cfg["baseline_5m"]
+    baseline_15m_cfg = flow_cfg["baseline_15m"]
     for e in enriched:
+        e.flow_baseline_source = ""
         entries = history.get(e.code, [])
         if not entries:
             e.flow_5m_inc = float("nan")
             e.flow_15m_inc = float("nan")
+            # 无快照历史的行也要给出同口径代理值，避免沿用 enrich 阶段的临时值
+            e.buy_ratio = compute_buy_ratio(e, flow_cfg)
             continue
 
         # Find best baseline for 5-min window (3–7 minutes ago, prefer closest to 5min)
@@ -1860,8 +2693,8 @@ def apply_flow_increments(enriched: List[Enriched], history: Dict[str, List[Dict
         best_diff_5m = 999999
         for h in entries:
             age = now - h.get("ts", 0)
-            if 180 <= age <= 420:  # 3–7 min
-                diff = abs(age - 300)
+            if float(baseline_5m_cfg["min_age_seconds"]) <= age <= float(baseline_5m_cfg["max_age_seconds"]):
+                diff = abs(age - float(baseline_5m_cfg["target_age_seconds"]))
                 if diff < best_diff_5m:
                     best_diff_5m = diff
                     baseline_5m = h
@@ -1871,8 +2704,8 @@ def apply_flow_increments(enriched: List[Enriched], history: Dict[str, List[Dict
         best_diff_15m = 999999
         for h in entries:
             age = now - h.get("ts", 0)
-            if 600 <= age <= 1200:  # 10–20 min
-                diff = abs(age - 900)
+            if float(baseline_15m_cfg["min_age_seconds"]) <= age <= float(baseline_15m_cfg["max_age_seconds"]):
+                diff = abs(age - float(baseline_15m_cfg["target_age_seconds"]))
                 if diff < best_diff_15m:
                     best_diff_15m = diff
                     baseline_15m = h
@@ -1887,6 +2720,10 @@ def apply_flow_increments(enriched: List[Enriched], history: Dict[str, List[Dict
         else:
             e.flow_15m_inc = float("nan")
 
+        if baseline_5m or baseline_15m:
+            e.flow_baseline_source = "snapshot"
+
+        # 主买比已在循环开头统一计算；此处保留顺序注释：
         # ── 量能快照差分（与"5分钟主力资金增量"同源，零额外查询）──
         # 当前累计额/量 减 历史快照 = 间隔增量；相对过去 N 根均值 = 量能倍数
         sorted_entries = sorted(entries, key=lambda h: h.get("ts", 0))
@@ -1899,8 +2736,8 @@ def apply_flow_increments(enriched: List[Enriched], history: Dict[str, List[Dict
         best_d = 999999
         for h in sorted_entries:
             age = now - h.get("ts", 0)
-            if 180 <= age <= 420:
-                d = abs(age - 300)
+            if float(baseline_5m_cfg["min_age_seconds"]) <= age <= float(baseline_5m_cfg["max_age_seconds"]):
+                d = abs(age - float(baseline_5m_cfg["target_age_seconds"]))
                 if d < best_d:
                     best_d = d
                     base_vol = h
@@ -1918,35 +2755,514 @@ def apply_flow_increments(enriched: List[Enriched], history: Dict[str, List[Dict
             if d > 0:
                 deltas.append(d)
         if deltas and recent_amt_delta > 0:
-            N = min(5, len(deltas))
+            N = min(int(flow_cfg["history_delta_lookback"]), len(deltas))
             past = deltas[-N:]
             past_avg = sum(past) / len(past)
             e.vol_ratio_vs_hist = (recent_amt_delta / past_avg) if past_avg > 0 else float("nan")
         else:
             e.vol_ratio_vs_hist = float("nan")
 
-        flow_cfg = RULE_CONFIG["screening"]["flow"]
         e.vol_surge = (
             not (isinstance(e.vol_ratio_vs_hist, float) and math.isnan(e.vol_ratio_vs_hist))
             and e.vol_ratio_vs_hist >= float(flow_cfg["volume_surge_ratio_min"])
             and recent_amt_delta > 0
         )
 
-        # ── 主力分笔主动买卖比 (buy_ratio) 生产数据源落地 ──
-        if is_number(e.main_net) and e.amount > 0:
-            denominator_floor = float(flow_cfg["buy_ratio_denominator_floor"])
-            surge_cap = float(flow_cfg["buy_ratio_surge_cap"])
-            surge_scale = float(flow_cfg["buy_ratio_surge_scale"])
-            base_ratio = (100.0 + e.main_pct) / max(denominator_floor, 100.0 - e.main_pct)
-            if e.super_net > 0 and e.big_net > 0 and is_number(e.flow_5m_inc) and e.flow_5m_inc > 0:
-                surge_factor = min(surge_cap, (e.flow_5m_inc / e.amount) * surge_scale)
-                e.buy_ratio = round(base_ratio + surge_factor, 2)
-            else:
-                e.buy_ratio = round(base_ratio, 2)
-        elif is_number(e.main_net) and e.main_net > 0:
-            e.buy_ratio = 1.6
+        # ── 主买比（代理值）：由主力净占比与 5 分钟增量推导，非真实分笔；缺成交额时为 NaN ──
+        e.buy_ratio = compute_buy_ratio(e, flow_cfg)
+
+
+def compute_buy_ratio(e: Enriched, flow_cfg: Dict[str, Any]) -> float:
+    """盘口推升代理值：由主力净占比与 5 分钟增量推导，不是真实分笔统计。
+
+    框架核验项要求“分笔连续主动买入”；此处只给出可排序的代理值，
+    真实分笔（stock/details/get）成功接入前，不得把该值当作分笔证据。
+    成交额或主力净额缺失时返回 NaN（未知），交由门槛拒绝，不做缺数据放行——
+    2026-09-26 修正：原实现在 amount<=0 时按主力净额正负硬编码返回 1.6/0.8，
+    其中 1.6 可直接满足 >=1.5 的主买比硬门槛，与“严禁缺数据放行”冲突。
+    """
+    if not (is_number(e.main_net) and e.amount > 0):
+        return float("nan")
+    denominator_floor = float(flow_cfg["buy_ratio_denominator_floor"])
+    surge_cap = float(flow_cfg["buy_ratio_surge_cap"])
+    surge_scale = float(flow_cfg["buy_ratio_surge_scale"])
+    base_ratio = (100.0 + e.main_pct) / max(denominator_floor, 100.0 - e.main_pct)
+    if e.super_net > 0 and e.big_net > 0 and is_number(e.flow_5m_inc) and e.flow_5m_inc > 0:
+        surge_factor = min(surge_cap, (e.flow_5m_inc / e.amount) * surge_scale)
+        return round(base_ratio + surge_factor, 2)
+    return round(base_ratio, 2)
+
+
+# ── 分钟资金流兜底基准 ────────────────────────────────────────────────
+# 本地快照差分零额外请求，但需要同一天已经跑过至少两轮才有基准：冷启动、断点重启、
+# 隔日首轮都会让 5/15 分钟增量变成“基准不足”，而这两个值是 A/B 类资金门槛的判定项，
+# 缺失时门槛无法评估。兜底方案是直接拉东财当日 1 分钟累计资金流序列（一次请求 240 根），
+# 用序列两个端点作差得到增量。请求有界：每轮上限 + 最小间隔 + 短 TTL 缓存。
+FLOW_MINUTE_TTL_SECONDS = 60.0         # 同一标的序列的缓存时长
+FLOW_MINUTE_MIN_INTERVAL_SECONDS = 0.4  # 相邻请求最小间隔，避免突发
+FLOW_MINUTE_MAX_CODES_PER_ROUND = 20    # 每轮最多为多少只补 5/15 分钟基准
+# 安全核验（高位派发、coalition 连续性）专用额度：不与基准补齐抢名额，
+# 否则补齐按主力净额取前 20 只后，安全类判定会全部退回"无法核验"。
+FLOW_MINUTE_SAFETY_RESERVE = 5
+_FLOW_MINUTE_CACHE: Dict[str, Any] = {}
+_FLOW_MINUTE_LOCK = threading.Lock()
+_FLOW_MINUTE_LAST_REQUEST_AT = 0.0
+# 每轮的请求预算：由 fetch_flow_minutes 统一扣减，新增调用点不会绕过上限
+_FLOW_MINUTE_ROUND_CODES: set = set()
+_FLOW_MINUTE_ROUND_LOCK = threading.Lock()
+_FLOW_MINUTE_ROUND_EXPECTED_DATE: Optional[str] = None
+
+
+def reset_flow_minute_round(expected_date: Optional[str] = None) -> None:
+    """每轮筛选开始前调用：重置分钟序列请求预算与"无法核验"计数（已取到的缓存保留）。
+
+    expected_date 为本轮行情快照交易日，同时作为"允许用分钟序列兜底核验"的开关：
+    未进入筛选轮的调用（含单测）保持 None，不会隐式联网。
+    """
+    global _LOW_ABSORB_UNVERIFIED_COUNT, _FLOW_MINUTE_ROUND_EXPECTED_DATE
+    with _FLOW_MINUTE_ROUND_LOCK:
+        _FLOW_MINUTE_ROUND_CODES.clear()
+    _LOW_ABSORB_UNVERIFIED_COUNT = 0
+    _FLOW_MINUTE_ROUND_EXPECTED_DATE = expected_date
+
+
+def round_series_date() -> Optional[str]:
+    """本轮行情快照交易日；None 表示未进入筛选轮（禁用分钟序列兜底）。"""
+    return _FLOW_MINUTE_ROUND_EXPECTED_DATE
+
+
+_LOW_ABSORB_UNVERIFIED_COUNT = 0
+
+
+def _note_low_absorb_unverified() -> None:
+    global _LOW_ABSORB_UNVERIFIED_COUNT
+    _LOW_ABSORB_UNVERIFIED_COUNT += 1
+
+
+def low_absorb_unverified_count() -> int:
+    """本轮满足高位条件、但既无快照又无分钟序列、无法核验派发信号的只数。"""
+    return _LOW_ABSORB_UNVERIFIED_COUNT
+
+
+def _flow_minute_budget_ok(code: str) -> bool:
+    """本轮是否还能为这只股票请求分钟序列。已在缓存或本轮请求过的直接放行。
+
+    总上限 = 基准补齐额度 + 安全核验保留额度；补齐函数自身已按基准额度切片，
+    因此这里放宽的额度实际留给低位吸高位派发/coalition 连续性这类核验。
+    """
+    with _FLOW_MINUTE_ROUND_LOCK:
+        if code in _FLOW_MINUTE_ROUND_CODES or code in _FLOW_MINUTE_CACHE:
+            return True
+        if len(_FLOW_MINUTE_ROUND_CODES) >= (
+            FLOW_MINUTE_MAX_CODES_PER_ROUND + FLOW_MINUTE_SAFETY_RESERVE
+        ):
+            return False
+        _FLOW_MINUTE_ROUND_CODES.add(code)
+        return True
+
+
+def _contiguous_tail_start(series: List[Tuple[str, ...]]) -> int:
+    """返回最后一段"每分钟连续"的起点索引。
+
+    行情分钟序列在午休（11:30 → 13:01）和接口缺 bar 处会出现时间缺口。按记录条数取窗口
+    （如 series[-6]）会跨越缺口：2026-09-26 实测在 13:03 计算时 [-6] 取到 11:28，
+    把约 95 分钟的累计变化当成"5 分钟增量"。因此所有窗口计算只在最后一段连续分钟里进行，
+    缺口之前的数据一律不参与；样本不足就返回"无法核验"，不猜。
+    """
+    if not series:
+        return 0
+    start = len(series) - 1
+    while start > 0:
+        prev = _minutes_of_hhmm(series[start - 1][0])
+        cur = _minutes_of_hhmm(series[start][0])
+        if prev is None or cur is None or cur - prev != 1:
+            break
+        start -= 1
+    return start
+
+
+def _column_values(tail: List[Tuple[str, ...]], column: int) -> List[Optional[float]]:
+    """按时间位置取出某一列的取值，缺值保留为 None。
+
+    2026-09-26 修正：不能先过滤掉非数值再按条数取窗口——某根 bar 该列缺值时会压缩位置，
+    让相隔 6 分钟的端点被当成 5 分钟增量。缺值必须占位，让用到它的窗口自己判定不可用。
+    """
+    out: List[Optional[float]] = []
+    for row in tail:
+        value = row[column] if len(row) > column else None
+        out.append(float(value) if is_number(value) else None)
+    return out
+
+
+def flow_window_deltas(
+    series: List[Tuple[str, float, float]], window: int = 5, column: int = 1
+) -> List[float]:
+    """把当日累计序列切成每 window 分钟的增量序列；越靠后越新。样本不足返回空列表。
+
+    只在最后一段连续分钟里计算（见 `_contiguous_tail_start`），午休/缺 bar 不跨越。
+    窗口端点若缺值，该窗口记 NaN（不可用）；中间某根缺值不影响跨度差——
+    端点是各自独立取到的累计值，时间跨度已由连续性检查保证。
+    column: 1=主力净额，2=超大单净额（对应 f52 / f56）。
+    """
+    tail = series[_contiguous_tail_start(series):]
+    values = _column_values(tail, column)
+    if len(values) <= window:
+        return []
+    deltas: List[float] = []
+    for i in range(window, len(values)):
+        current, base = values[i], values[i - window]
+        if current is None or base is None:
+            deltas.append(float("nan"))
         else:
-            e.buy_ratio = 0.8
+            deltas.append(current - base)
+    return deltas
+
+
+def flow_continuity_from_minutes(
+    series: List[Tuple[str, float, float]], periods: int,
+    window_minutes: int = 5, column: int = 1,
+) -> Optional[bool]:
+    """用分钟序列判断最近 periods 个窗口是否未衰减。
+
+    未衰减 = 每个窗口增量非负（等价于累计值不下降，与快照口径一致）。
+    样本不足、跨午休导致连续段不够长、或窗口内端点缺值，统一返回 None（无法核验）——
+    不返回 False，避免把"缺数据"当成"已衰减"。
+    """
+    deltas = flow_window_deltas(series, window_minutes, column)
+    if len(deltas) < periods:
+        return None
+    recent = deltas[-periods:]
+    if any(not is_number(delta) for delta in recent):
+        return None
+    return all(delta >= 0 for delta in recent)
+
+
+def flow_negative_samples_from_minutes(
+    series: List[Tuple[str, float, float]], samples: int, spacing_minutes: int = 5
+) -> Optional[int]:
+    """最近 samples 个等间隔采样点里，累计主力净额 ≤ 0 的个数。
+
+    只在最后一段连续分钟里按固定间隔采样（保证采样点之间真的隔了 spacing 分钟），
+    对齐快照口径：数的是累计值是否为负，不是窗口增量。
+    采样点缺值即视为无法核验（这里数的是取值本身，缺了不能跳过也不能当 0）。
+    """
+    tail = series[_contiguous_tail_start(series):]
+    values = _column_values(tail, 1)
+    if not values:
+        return None
+    points = values[::-1][::spacing_minutes]
+    if len(points) < samples:
+        return None
+    recent = points[:samples]
+    if any(value is None for value in recent):
+        return None
+    return sum(1 for value in recent if value <= 0)
+
+
+def _flow_minute_series_for(code: str, expected_date: Optional[str]) -> List[Tuple[str, float, float]]:
+    """取分钟序列，失败返回空列表（不抛异常，调用方按"无法核验"处理）。"""
+    try:
+        return fetch_flow_minutes(code, expected_date=expected_date)
+    except Exception:
+        return []
+
+
+def _pace_flow_minute_request() -> None:
+    global _FLOW_MINUTE_LAST_REQUEST_AT
+    with _FLOW_MINUTE_LOCK:
+        now = time.monotonic()
+        wait = FLOW_MINUTE_MIN_INTERVAL_SECONDS - (now - _FLOW_MINUTE_LAST_REQUEST_AT)
+        if wait > 0:
+            time.sleep(wait)
+        _FLOW_MINUTE_LAST_REQUEST_AT = time.monotonic()
+
+
+def _is_intraday_now(ts: Optional[datetime] = None) -> bool:
+    """当前是否在连续竞价时段内（含 09:15 盘前与 15:05 收盘缓冲）。"""
+    moment = ts or datetime.now(TZ)
+    if moment.weekday() >= 5:
+        return False
+    minutes = moment.hour * 60 + moment.minute
+    return (9 * 60 + 15) <= minutes <= (15 * 60 + 5)
+
+
+def _minutes_of_hhmm(hhmm: str) -> Optional[int]:
+    parts = str(hhmm).split(":")
+    if len(parts) != 2:
+        return None
+    try:
+        return int(parts[0]) * 60 + int(parts[1])
+    except ValueError:
+        return None
+
+
+def fetch_flow_minutes(code: str, expected_date: Optional[str] = None) -> List[Tuple[str, float]]:
+    """拉当日 1 分钟累计主力净额序列，返回 [(HH:MM, 累计主力净额), ...]。
+
+    expected_date 为本次行情快照所属交易日（YYYY-MM-DD）；bar 日期与之不符即视为过期序列。
+    盘中另加 10 分钟新鲜度校验。校验不过一律返回空，交由上层保持“基准不足”，不猜、不补零。
+    """
+    now = time.time()
+    cached = _FLOW_MINUTE_CACHE.get(code)
+    if cached and now - float(cached[0]) <= FLOW_MINUTE_TTL_SECONDS:
+        return cached[1]
+    if not _flow_minute_budget_ok(code):
+        return []   # 本轮预算用完：保持"无基准/无法核验"，不额外发请求
+
+    params = {
+        "secid": secid_for(code),
+        "fields1": "f1,f2,f3,f7",
+        # f52=主力净额，f56=超大单净额（coalition 连续性要同时核验两者）
+        "fields2": "f51,f52,f56",
+        "klt": "1",
+        "lmt": "300",
+    }
+    moment = datetime.now(TZ)
+    expected = expected_date or moment.strftime("%Y-%m-%d")
+    now_minutes = moment.hour * 60 + moment.minute
+    last_error: Optional[Exception] = None
+    for url in _rank_urls(EM_FFLOW_MINUTE_URLS):
+        _pace_flow_minute_request()
+        try:
+            data = fetch_json(url, params, timeout=6)
+        except Exception as exc:
+            last_error = exc
+            _mark_host_failed(url)
+            continue
+        _mark_host_ok(url)
+        rows = ((data or {}).get("data") or {}).get("klines") or []
+        series: List[Tuple[str, float, float]] = []
+        last_date = ""
+        for line in rows:
+            parts = str(line).split(",")
+            if len(parts) < 2:
+                continue
+            stamp = parts[0].strip()
+            hhmm = stamp[-5:] if len(stamp) >= 5 else stamp
+            if " " in stamp:
+                last_date = stamp.split(" ")[0]
+            try:
+                main_net = float(parts[1])
+            except (TypeError, ValueError):
+                continue
+            try:
+                super_net = float(parts[2]) if len(parts) > 2 else float("nan")
+            except (TypeError, ValueError):
+                super_net = float("nan")
+            series.append((hhmm, main_net, super_net))
+        if not series:
+            continue
+        if last_date and last_date != expected:
+            continue
+        if _is_intraday_now(moment):
+            bar_minutes = _minutes_of_hhmm(series[-1][0])
+            if bar_minutes is None or (now_minutes - bar_minutes) > 10:
+                continue
+        _FLOW_MINUTE_CACHE[code] = (now, series)
+        return series
+    if last_error is not None:
+        raise last_error
+    return []
+
+
+def flow_increments_from_minutes(series: List[Tuple[str, float]]) -> Tuple[float, float]:
+    """用累计序列端点差得到 5/15 分钟增量；连续样本不足返回 NaN（显示为基准不足）。
+
+    只在最后一段连续分钟（见 `_contiguous_tail_start`）里取端点：跨午休或跨缺 bar 的
+    端点差不是"5/15 分钟增量"，宁可返回 NaN 交给门槛拒绝，也不能给出虚高/虚低的数字。
+    """
+    tail = series[_contiguous_tail_start(series):]
+    if len(tail) < 2:
+        return float("nan"), float("nan")
+    latest = tail[-1][1]
+    inc_5m = latest - tail[-6][1] if len(tail) >= 6 else float("nan")
+    inc_15m = latest - tail[-16][1] if len(tail) >= 16 else float("nan")
+    return inc_5m, inc_15m
+
+
+def fill_flow_increments_from_fflow(enriched: List[Enriched], expected_date: Optional[str] = None) -> int:
+    """快照基准缺失时用分钟序列补齐 5/15 分钟增量，返回补齐的只数。
+
+    只补缺项，不覆盖已有快照基准；单只失败保持 NaN，绝不写成 0。
+    expected_date 为本次行情快照交易日，用于拒绝隔日序列。
+    """
+    targets = [
+        e for e in enriched
+        if not is_number(e.flow_5m_inc) or not is_number(e.flow_15m_inc)
+    ]
+    if not targets:
+        return 0
+    targets.sort(key=lambda e: e.main_net if is_number(e.main_net) else 0.0, reverse=True)
+
+    flow_cfg = SCREENING_CONFIG["flow"]
+    filled = 0
+    for e in targets[:FLOW_MINUTE_MAX_CODES_PER_ROUND]:
+        try:
+            series = fetch_flow_minutes(e.code, expected_date=expected_date)
+        except Exception:
+            continue
+        inc_5m, inc_15m = flow_increments_from_minutes(series)
+        changed = False
+        if not is_number(e.flow_5m_inc) and is_number(inc_5m):
+            e.flow_5m_inc = inc_5m
+            changed = True
+        if not is_number(e.flow_15m_inc) and is_number(inc_15m):
+            e.flow_15m_inc = inc_15m
+            changed = True
+        if changed:
+            e.flow_baseline_source = "fflow"
+            e.buy_ratio = compute_buy_ratio(e, flow_cfg)
+            filled += 1
+    return filled
+
+
+def flow_veto_reason(e: Enriched) -> str:
+    """框架一票否决：超大单为负。返回标记文本，未触发返回空串。
+
+    2026-09-26 补：原先该否决只在诊断工具 tools/scan_reports.py 里执行，引擎负责发现但
+    行上没有任何标记，只能靠人去看"超大单"那一列，漏看就绕过了否决。现在引擎直接打标，
+    并在报告顶部汇总列出，与公告风险的标注方式一致。
+    """
+    if not RULE_CONFIG["dominance"].get("negative_super_veto"):
+        return ""
+    super_net = getattr(e, "super_net", None)
+    if is_number(super_net) and float(super_net) < 0:
+        return "超大单为负·一票否决"
+    return ""
+
+
+# 区间分位标注档位（纯展示，不参与门槛）：现价处于当日区间 ≥80% 记偏高，≥90% 记贴顶。
+# 阈值依据：2026-09-24 全量报告 42 个候选行的区间分位中位数 76%、≥70% 的占 86%——
+# 70% 那条线几乎每行都触发、没有区分度，因此上调为两档（≥80% 占 21%、≥90% 占 7%）。
+# 若以后要把它变成"不追高"的硬门槛，请先按框架维护纪律搬进 tools/rule_config.py 并记录。
+RANGE_POSITION_WARN_PCT = 80.0
+RANGE_POSITION_TOP_PCT = 90.0
+
+
+def range_position_cell(row: Dict[str, Any]) -> str:
+    """把现价在当日区间的分位渲染成报告单元格：≥80% 标 ⚠，≥90% 标 ⚠顶。"""
+    value = row.get("range_pct")
+    if not is_number(value):
+        return "-"
+    pct = float(value)
+    if pct >= RANGE_POSITION_TOP_PCT:
+        return f"{pct:.0f}%⚠顶"
+    if pct >= RANGE_POSITION_WARN_PCT:
+        return f"{pct:.0f}%⚠"
+    return f"{pct:.0f}%"
+
+
+def flow_veto_suffix(row: Dict[str, Any]) -> str:
+    """超大单为负的一票否决标记后缀；未触发返回空串。"""
+    return f"；❌{row['flow_veto']}" if row.get("flow_veto") else ""
+
+
+def shadow_badge_text(badge: Optional[Dict[str, Any]]) -> str:
+    """负超单观察行的影子徽标文案。
+
+    徽标由报告落盘后的只读判定器（tools/detect_divergence_leader）回填；
+    未回填、历史不足或该股不在判定器的低吸表中，一律显示“未完成判定”，
+    不得显示成“不符合”。
+    """
+    if not isinstance(badge, dict):
+        return "未完成判定"
+    status = badge.get("status")
+    if status == "triggered":
+        when = badge.get("trigger_time") or "-"
+        return f"今日已触发影子条件 · 触发时间 {when}"
+    if status == "not_triggered":
+        return "未触发（判定完成）"
+    return "未完成判定"
+
+
+def flow_status_cell(row: Dict[str, Any]) -> str:
+    """资金状态单元格：拼上一票否决标记。
+
+    2026-09-26 补：引擎只在顶部告警与资金追踪明细里体现否决，池表与低吸表的行上看不出来，
+    而这几张表正是挑标的的地方。现在统一走这里，保证每条候选行都带标记。
+    """
+    return f"{row.get('flow_status', '') or ''}{flow_veto_suffix(row)}"
+
+
+def capital_data_label(e: Enriched, has_5m: bool) -> str:
+    """数据完整度标签：区分快照基准、分钟序列兜底基准、无基准三种来源。"""
+    if not has_5m:
+        return "仅当前快照"
+    return "含分钟序列" if e.flow_baseline_source == "fflow" else "含连续快照"
+
+
+def is_negative_super(e: Any) -> bool:
+    """是否属于「超大单为负」样本：必须是有限数值且为负。
+
+    缺失、NaN、±inf 一律不算负值样本，也不得视为通过门槛。
+    """
+    super_net = getattr(e, "super_net", None)
+    if not is_number(super_net):
+        return False
+    value = float(super_net)
+    return math.isfinite(value) and value < 0
+
+
+def count_negative_super_observations(enriched: List["Enriched"]) -> int:
+    """只统计数量、不构造观察行、不触发任何公告查询。
+
+    严格模式（负超单观察未开启）用它报告“影响数量”，避免为隐藏列表白跑公告接口。
+    """
+    return sum(1 for e in enriched if is_negative_super(e))
+
+
+def build_negative_super_observations(
+    enriched: List["Enriched"],
+    stats: Dict[str, Dict[str, Any]],
+    flow_history: Optional[Dict[str, List[Dict[str, Any]]]],
+    ts,
+) -> List[Dict[str, Any]]:
+    """负超单观察：独立的观察列表，不进入任何真实仓/模拟仓资格。
+
+    与生产否决标记同源（``super_net < 0``），但这里只如实展示事实与卡点：
+      - 只收 ``is_negative_super`` 的行；缺失或非数值一律不算负值样本。
+      - 逐项列出未通过的门槛（超大单为负一票否决、非 absolute 主导），
+        不伪造 absolute/coalition 标签，也不写成“仅差一个条件即可买”。
+    """
+    rows: List[Dict[str, Any]] = []
+    data_time = ts.strftime("%Y-%m-%d %H:%M:%S") if ts is not None else ""
+    for e in enriched:
+        if not is_negative_super(e):
+            continue
+        dom_type, dom_label = evaluate_dominance_type(e, flow_history)
+        blockers: List[str] = []
+        if e.flow_veto:
+            blockers.append(f"{e.flow_veto}（框架一票否决）")
+        if dom_type != "absolute":
+            blockers.append(f"主导标签 {dom_label}，不满足 absolute（真实仓资格）")
+        rows.append({
+            "code": e.code,
+            "name": e.name,
+            "data_time": data_time,
+            "price": e.price,
+            "change": e.change,
+            "turnover": e.turnover,
+            "amount": e.amount,
+            "industry": e.industry,
+            "super_net": e.super_net,
+            "main_net": e.main_net,
+            "big_net": e.big_net,
+            "main_pct": e.main_pct,
+            "flow_5m_inc": e.flow_5m_inc,
+            "vwap_state": e.vwap_state,
+            "price_above_vwap": e.price_above_vwap,
+            "resonance": "是" if has_resonance(e, stats) else "否",
+            "flow_status": e.flow_status,
+            "flow_veto": e.flow_veto,
+            "risk_status": e.risk_status,
+            "dominance_type": dom_type,
+            "dominance_label": dom_label,
+            "blockers": blockers,
+            # 报告落盘后由只读判定器回填影子徽标；未回填一律视为“未完成判定”。
+            "shadow_badge": None,
+        })
+    rows.sort(key=lambda r: r["super_net"])
+    return rows
 
 
 def classify_flow(e: Enriched, stats: Dict[str, Dict[str, Any]], has_snapshot: bool) -> str:
@@ -1954,15 +3270,18 @@ def classify_flow(e: Enriched, stats: Dict[str, Dict[str, Any]], has_snapshot: b
 
     Returns one of: 有效流入, 疑似流入, 价量背离, 疑似派发, 数据不足
     """
-    if not has_snapshot:
+    if not has_snapshot and not e.flow_baseline_source:
         return "数据不足"
 
     # Check conditions
+    flow_cfg = SCREENING_CONFIG["flow"]
+    classification_cfg = flow_cfg["classification"]
+    alignment_ratio = float(classification_cfg["alignment_ratio_max_exclusive"])
     main_positive = e.main_net > 0
     super_big_aligned = (e.super_net > 0 and e.big_net > 0) or (
-        e.super_net > 0 and abs(e.big_net) < abs(e.super_net) * 0.3
-    ) or (e.big_net > 0 and abs(e.super_net) < abs(e.big_net) * 0.3)
-    price_rising = e.change > 0
+        e.super_net > 0 and abs(e.big_net) < abs(e.super_net) * alignment_ratio
+    ) or (e.big_net > 0 and abs(e.super_net) < abs(e.big_net) * alignment_ratio)
+    price_rising = e.change > float(classification_cfg["price_rising_min_exclusive"])
     above_vwap = e.price_above_vwap
     has_5m = not (isinstance(e.flow_5m_inc, float) and math.isnan(e.flow_5m_inc))
     flow_increasing = has_5m and e.flow_5m_inc > 0
@@ -1970,7 +3289,7 @@ def classify_flow(e: Enriched, stats: Dict[str, Dict[str, Any]], has_snapshot: b
     # 疑似派发: small orders in, large orders out, stock at high position
     small_in = e.small_net > 0
     big_out = e.super_net < 0 and e.big_net < 0
-    at_high = e.dist60 < 0.05 if is_number(e.dist60) else False
+    at_high = e.dist60 < float(classification_cfg["at_high_dist60_max_exclusive"]) if is_number(e.dist60) else False
 
     if small_in and big_out and at_high:
         return "疑似派发"
@@ -1978,12 +3297,15 @@ def classify_flow(e: Enriched, stats: Dict[str, Dict[str, Any]], has_snapshot: b
     # 价量背离: capital/volume increasing but price not rising or below VWAP
     if main_positive and (not price_rising or not above_vwap) and flow_increasing:
         return "价量背离"
-    if e.main_pct > 3 and e.change < -1:
+    if (
+        e.main_pct > float(classification_cfg["divergence_main_pct_min_exclusive"])
+        and e.change < float(classification_cfg["divergence_change_max_exclusive"])
+    ):
         return "价量背离"
 
     # 有效流入: main force positive + sustained, super+big aligned, price up, above VWAP
     if main_positive and super_big_aligned and price_rising and above_vwap:
-        if flow_increasing or e.main_pct > 5:
+        if flow_increasing or e.main_pct > float(classification_cfg["effective_main_pct_min_exclusive"]):
             return "有效流入"
 
     # 疑似流入: main force positive but some conditions not met
@@ -2020,7 +3342,7 @@ def evaluate_dominance_type(
       超大单 > 0 且 超大单 / 主力净额 >= 50%
     条件 B ｜ 合力主导 (coalition):
       超大单 >= 2000万 且 大单 > 0 且 20% <= 超大单/主力 < 50% 且 主力 >= 5000万
-      且 5分钟增量 >= 1000万 且 最近2次快照主力与超大单均未衰减 且 分笔主买比 >= 1.5
+      且 5分钟增量 >= 1000万 且 最近2次快照主力与超大单均未衰减 且 主买比（代理值） >= 1.5
       【严禁缺数据放行：历史不足2期或主买比缺失/小于1.5一律拒绝】
     """
     super_net = getattr(e, "super_net", 0)
@@ -2060,23 +3382,29 @@ def evaluate_dominance_type(
     )
 
     if is_coalition_amounts:
-        # 硬门槛 1: 分笔主买比必须存在且 >= 1.5（严禁 None 放行）
+        # 硬门槛 1: 主买比（代理值，非真实分笔）必须存在且 >= 1.5（严禁 None/缺数据放行）
         if buy_ratio is None or buy_ratio < float(coalition_cfg["min_buy_ratio"]):
             return "none", none_label
 
-        # 硬门槛 2: 必须有连续至少 2 期快照且未衰减（严禁缺历史放行）
-        if not flow_history or code not in flow_history:
-            return "none", none_label
-
-        snaps = flow_history[code]
-        if len(snaps) < int(coalition_cfg["min_history_snapshots"]):
-            return "none", none_label
-
-        prev_main = snaps[-2].get("main_net", 0)
-        prev_super = snaps[-2].get("super_net", 0)
-        keep_ratio = 1.0 - float(coalition_cfg["max_decay_pct"]) / 100.0
-        if main_net < prev_main * keep_ratio or super_net < prev_super * keep_ratio:
-            return "none", none_label
+        # 硬门槛 2: 必须有连续至少 2 期且主力与超大单均未衰减（严禁缺历史放行）
+        min_snaps = int(coalition_cfg["min_history_snapshots"])
+        snaps = (flow_history or {}).get(code) or []
+        if len(snaps) >= min_snaps:
+            prev_main = snaps[-2].get("main_net", 0)
+            prev_super = snaps[-2].get("super_net", 0)
+            keep_ratio = 1.0 - float(coalition_cfg["max_decay_pct"]) / 100.0
+            if main_net < prev_main * keep_ratio or super_net < prev_super * keep_ratio:
+                return "none", none_label
+        else:
+            # 2026-09-26：本地快照不足时用东财分钟序列核验"连续未衰减"（口径等价：
+            # 累计值不下降 ⟺ 窗口增量非负）。主力(f52)与超大单(f56)两列都要通过，
+            # 任一列样本不足即视为无法核验，按原规则拒绝——不靠单列放松门槛。
+            date = round_series_date()
+            series = _flow_minute_series_for(code, date) if date else []
+            main_ok = flow_continuity_from_minutes(series, min_snaps, column=1)
+            super_ok = flow_continuity_from_minutes(series, min_snaps, column=2)
+            if main_ok is not True or super_ok is not True:
+                return "none", none_label
 
         return "coalition", coalition_cfg["label"]
 
@@ -2096,7 +3424,8 @@ def rank_capital_candidates(
     - 赋予 sector_boost 与 B类优选资格 (b_preferred)
     - 板块内归一化排序兼顾 5分钟净额 与 5分钟净额/成交额
     """
-    sector_cfg = RULE_CONFIG["screening"]["sector_boost"]
+    sector_cfg = SCREENING_CONFIG["sector_boost"]
+    score_cfg = SCREENING_CONFIG["capital_rank"]
     # 1. 扫描板块锚点与共振
     sector_anchors: Dict[str, List[Enriched]] = {}
     sector_resonance_counts: Dict[str, int] = {}
@@ -2127,20 +3456,39 @@ def rank_capital_candidates(
 
         # 0-100 score: current relative flow 55, persistence 20,
         # price confirmation 15, sector confirmation 10.
-        main_points = max(0.0, min(35.0, e.main_pct / 8.0 * 35.0))
-        super_points = max(0.0, min(20.0, e.super_pct / 5.0 * 20.0))
+        main_points = max(
+            0.0,
+            min(
+                float(score_cfg["score_main_max_points"]),
+                e.main_pct / float(score_cfg["score_main_pct_scale"]) * float(score_cfg["score_main_max_points"]),
+            ),
+        )
+        super_points = max(
+            0.0,
+            min(
+                float(score_cfg["score_super_max_points"]),
+                e.super_pct / float(score_cfg["score_super_pct_scale"]) * float(score_cfg["score_super_max_points"]),
+            ),
+        )
         persistence_points = 0.0
         if has_5m:
             increment_pct = e.flow_5m_inc / e.amount * 100 if e.amount > 0 else 0.0
-            persistence_points = max(0.0, min(20.0, increment_pct / 1.5 * 20.0))
+            persistence_points = max(
+                0.0,
+                min(
+                    float(score_cfg["score_persistence_max_points"]),
+                    increment_pct / float(score_cfg["score_persistence_pct_scale"])
+                    * float(score_cfg["score_persistence_max_points"]),
+                ),
+            )
 
-        if e.price_above_vwap and e.change > 0:
-            price_points = 15.0
+        if e.price_above_vwap and e.change > float(score_cfg["score_price_change_min_exclusive"]):
+            price_points = float(score_cfg["score_price_positive_points"])
         elif e.price_above_vwap:
-            price_points = 7.0
+            price_points = float(score_cfg["score_price_nonpositive_points"])
         else:
             price_points = 0.0
-        sector_points = 10.0 if resonance else 0.0
+        sector_points = float(score_cfg["score_resonance_points"]) if resonance else 0.0
 
         # 板块协同加分器 (sector_boost)
         sector_boost = 0.0
@@ -2172,6 +3520,8 @@ def rank_capital_candidates(
         score = main_points + super_points + persistence_points + price_points + sector_points + sector_boost
 
         reasons: List[str] = []
+        if getattr(e, "flow_veto", ""):
+            reasons.append(f"❌{e.flow_veto}")
         if e.main_pct > 0:
             reasons.append(f"主力净占比{e.main_pct:.1f}%")
         else:
@@ -2192,21 +3542,25 @@ def rank_capital_candidates(
             reasons.append(f"主线板块协同(+{int(sector_boost)}分,20亿锚点带动)")
 
         if e.flow_status == "疑似派发":
-            score -= 35.0
+            score -= float(score_cfg["penalty_distribution"])
             reasons.append("疑似派发")
         elif e.flow_status == "价量背离":
-            score -= 20.0
+            score -= float(score_cfg["penalty_divergence"])
             reasons.append("价量背离")
         if e.main_net < 0:
-            score -= 20.0
-        if e.high_pull > 1.5:
-            score -= min(15.0, (e.high_pull - 1.5) * 5.0)
+            score -= float(score_cfg["penalty_main_out"])
+        if e.high_pull > float(score_cfg["penalty_high_pull_free_max_inclusive"]):
+            score -= min(
+                float(score_cfg["penalty_high_pull_max_points"]),
+                (e.high_pull - float(score_cfg["penalty_high_pull_free_max_inclusive"]))
+                * float(score_cfg["penalty_high_pull_scale"]),
+            )
             reasons.append("高位回落偏大")
 
         score = round(max(0.0, min(100.0, score)), 1)
-        if e.flow_status == "疑似派发" or score < 40:
+        if e.flow_status == "疑似派发" or score < float(score_cfg["capital_class_c_score_max_exclusive"]):
             capital_class = "资金C类"
-        elif score >= 70 and e.main_net > 0 and e.price_above_vwap:
+        elif score >= float(score_cfg["capital_class_a_score_min_inclusive"]) and e.main_net > 0 and e.price_above_vwap:
             capital_class = "资金A类"
         else:
             capital_class = "资金B类"
@@ -2214,13 +3568,16 @@ def rank_capital_candidates(
         # 板块内归一化弹性得分（兼顾 5分净额与 5分/成交额）
         norm_score = score
         if has_5m and e.amount > 0:
-            norm_score += min(10.0, (e.flow_5m_inc / e.amount) * 50.0)
+            norm_score += min(
+                float(score_cfg["normalized_flow_max_points"]),
+                (e.flow_5m_inc / e.amount) * float(score_cfg["normalized_flow_scale"]),
+            )
 
         ranked.append({
             **asdict(e),
             "capital_score": score,
             "capital_class": capital_class,
-            "capital_data": "含连续快照" if has_5m else "仅当前快照",
+            "capital_data": capital_data_label(e, has_5m),
             "capital_reason": "；".join(reasons),
             "resonance": "是" if resonance else ("数据质量降级" if not resonance_usable else "否"),
             "dominance_type": dom_type,
@@ -2363,20 +3720,23 @@ def load_intersection_state() -> Dict[str, Any]:
     return {"date": "", "items": {}}
 
 
-def save_intersection_state(items: Dict[str, Dict[str, Any]], date_text: str) -> None:
-    """按交易日原子写入（tmp + os.replace），进程被杀不产生半截文件。"""
-    try:
-        for item in items.values():
-            if isinstance(item, dict):
-                item.setdefault("trade_date", date_text)
-        tmp = INTERSECTION_STATE_FILE.with_suffix(".json.tmp")
-        tmp.write_text(
-            json.dumps({"date": date_text, "items": items}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        os.replace(tmp, INTERSECTION_STATE_FILE)
-    except Exception:
-        pass
+def save_intersection_state(
+    items: Dict[str, Dict[str, Any]],
+    date_text: str,
+    commit: Optional[state_commit.RoundCommit] = None,
+) -> None:
+    """按交易日原子写入（tmp + os.replace），进程被杀不产生半截文件。
+
+    ``commit`` 非空时只暂存：看板超时/失败的一轮不得提交交集状态。
+    """
+    for item in items.values():
+        if isinstance(item, dict):
+            item.setdefault("trade_date", date_text)
+    state_commit.write_or_stage(
+        commit,
+        INTERSECTION_STATE_FILE,
+        json.dumps({"date": date_text, "items": items}, ensure_ascii=False, indent=2),
+    )
 
 
 def _parse_intersection_datetime(value: Any) -> Optional[datetime]:
@@ -2392,6 +3752,8 @@ def _intersection_rejection_reasons(row: Dict[str, Any]) -> List[str]:
     reasons: List[str] = []
 
     flow_status = str(row.get("flow_status") or "")
+    if row.get("flow_veto"):
+        reasons.append(str(row["flow_veto"]))
     if flow_status in {"疑似派发", "价量背离"}:
         reasons.append("主力资金反向")
     main_net = row.get("main_net")
@@ -2424,8 +3786,8 @@ def _intersection_rejection_reasons(row: Dict[str, Any]) -> List[str]:
         reasons.append("无板块共振")
 
     risk = _row_risk_status(row)
-    if risk != RISK_CLEAN:
-        reasons.append(f"公告风险非clean({risk})")
+    if risk_blocks_formal_qualification(risk):
+        reasons.append(f"公告风险否决({risk})")
 
     deduped: List[str] = []
     for reason in reasons:
@@ -2446,14 +3808,16 @@ def _predict_trigger_price(row: Dict[str, Any], missing: Optional[str]) -> Optio
     ma5 = row.get("ma5")
     ma10 = row.get("ma10")
     ma20 = row.get("ma20")
+    trigger_multiplier = float(SCREENING_CONFIG["strict_trend"]["preintersection_trigger_multiplier"])
     if missing == "当日涨幅" and is_number(prev_close) and prev_close > 0:
-        return round(prev_close * 1.03, 2)          # strict_trend 当日涨幅下限 3%
+        change_min = float(SCREENING_CONFIG["strict_trend"]["change_min_inclusive"])
+        return round(prev_close * (1 + change_min / 100), 2)
     if missing == "价格相对MA5" and is_number(ma5) and ma5 > 0:
-        return round(ma5 * 1.001, 2)
+        return round(ma5 * trigger_multiplier, 2)
     if missing == "价格相对MA10" and is_number(ma10) and ma10 > 0:
-        return round(ma10 * 1.001, 2)
+        return round(ma10 * trigger_multiplier, 2)
     if missing == "价格相对MA20" and is_number(ma20) and ma20 > 0:
-        return round(ma20 * 1.001, 2)
+        return round(ma20 * trigger_multiplier, 2)
     # 距60日高点 / 换手率 / 成交额 / 量能 / 5日涨幅 / MA20斜率 / 价格区间 / 流通市值：
     # 结构性条件，无法用单一触发价表达
     return None
@@ -2640,12 +4004,14 @@ def compute_pre_intersection(
     diag_by_code: Dict[str, Dict[str, Any]],
     cfg: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
-    """准交集预警：超短池 + 距趋势确认(质量条件)仅差1项 + 四道门槛（相位由 evaluate 决定）。
+    """准交集预警：超短池 + 距趋势确认(质量条件)仅差1项 + 前置门槛通过（相位由 evaluate 决定）。
 
+    前置门槛为 主力净额 / 5分钟资金 / 均价线上；板块共振已降为参考项，不单独否决。
     缺失条件与"差一项"判定直接用行内字段（价格相对MA/MA20斜率/当日涨幅/5日涨幅/
     距60高/换手/成交/量能），不含价格区间与流通市值（已由超短池约束），避免错误
     排除哈药(~5.8)等低价强势股。候选行携带 preintersection_missing 与 trigger_price。
     """
+    strict_cfg = SCREENING_CONFIG["strict_trend"]
     out: List[Dict[str, Any]] = []
     for r in strict_ultra_rows:
         code = str(r.get("code"))
@@ -2656,12 +4022,32 @@ def compute_pre_intersection(
             ("价格相对MA10", is_number(r.get("ma10")) and r["price"] > r["ma10"]),
             ("价格相对MA20", is_number(r.get("ma20")) and r["price"] > r["ma20"]),
             ("MA20斜率", is_number(r.get("prev_ma20")) and r["ma20"] > r["prev_ma20"]),
-            ("当日涨幅", is_number(r.get("change")) and 3 <= r["change"] <= 6.5),
-            ("5日涨幅", is_number(r.get("five_ret")) and r["five_ret"] <= 0.20),
-            ("距60日高点", is_number(r.get("dist60")) and r["dist60"] <= 0.10),
-            ("换手率", is_number(r.get("turnover")) and 2 <= r["turnover"] <= 8),
-            ("成交额", is_number(r.get("amount")) and r["amount"] > 300_000_000),
-            ("量能相对5日", is_number(r.get("vol_vs_avg5")) and r["vol_vs_avg5"] <= 2),
+            (
+                "当日涨幅",
+                is_number(r.get("change"))
+                and float(strict_cfg["change_min_inclusive"]) <= r["change"] <= float(strict_cfg["change_max_inclusive"]),
+            ),
+            (
+                "5日涨幅",
+                is_number(r.get("five_ret")) and r["five_ret"] <= float(strict_cfg["five_ret_max_inclusive"]),
+            ),
+            (
+                "距60日高点",
+                is_number(r.get("dist60")) and r["dist60"] <= float(strict_cfg["dist60_max_inclusive"]),
+            ),
+            (
+                "换手率",
+                is_number(r.get("turnover"))
+                and float(strict_cfg["turnover_min_inclusive"]) <= r["turnover"] <= float(strict_cfg["turnover_max_inclusive"]),
+            ),
+            (
+                "成交额",
+                is_number(r.get("amount")) and r["amount"] > float(strict_cfg["amount_min_exclusive"]),
+            ),
+            (
+                "量能相对5日",
+                is_number(r.get("vol_vs_avg5")) and r["vol_vs_avg5"] <= float(strict_cfg["vol_vs_avg5_max_inclusive"]),
+            ),
         ]
         failures = [name for name, ok in checks if not ok]
         trend_missing_count = len(failures)
@@ -2689,7 +4075,7 @@ def compute_pre_intersection(
         row["gate_failures"] = gate_failures
         row["gate_failure_text"] = "；".join(gate_failures) if gate_failures else "全部通过"
         row["risk_note"] = (
-            f"公告风险仅观察({risk})" if (phase in ("准交集", "等待转强") and risk != RISK_CLEAN) else ""
+            risk_note_text(risk) if (phase in ("准交集", "等待转强") and risk != RISK_CLEAN) else ""
         )
         out.append(row)
     return out
@@ -2757,15 +4143,18 @@ def evaluate_intersection_states(
             return status if status else RISK_UNKNOWN
         return _row_risk_status(row)
 
-    def _entry_allowed(risk: str) -> Tuple[bool, str]:
-        """新开仓资格 = 公告clean + 未过14:20 + 市场环境非CASH。
+    def _entry_allowed(risk: str, flow_veto: str = "") -> Tuple[bool, str]:
+        """新开仓资格 = 公告非一票否决 + 超大单非负 + 未过14:20 + 市场环境非CASH。
 
-        watch_risk 可预警可观察但不得新开仓；avoid/unknown 均否决。
+        框架一票否决有两条在这台状态机上生效：公告 avoid/unknown，以及超大单为负。
+        watch_risk 仅减分，不阻断状态资格（见 选股框架.md「一、信号与建仓门禁」）。
         DOWNGRADE 环境的附加条件（clean+共振+回踩确认）已是 ENTRY_ELIGIBLE
         的必要条件；CASH 一律禁止。
         """
-        if risk != RISK_CLEAN:
+        if risk_blocks_formal_qualification(risk):
             return False, f"公告风险否决({risk})"
+        if flow_veto:
+            return False, f"{flow_veto}（框架一票否决）"
         if past_deadline:
             return False, "已过新开仓截止，仅供明日观察"
         if market_mode == "CASH":
@@ -2788,12 +4177,12 @@ def evaluate_intersection_states(
         phase_code = _canonical_phase(item.get("phase"))
         label = display_label or PHASE_LABELS.get(phase_code, phase_code)
         risk = item.get("risk_status") or _risk_for(code, row)
-        risk_clean = risk == RISK_CLEAN
         first = _parse_intersection_datetime(item.get("first_intersection_at")) or now
         age = round(max(0.0, (now - first).total_seconds() / 60), 1)
         minute_info = minute_map.get(code)
         fresh, m_age, m_status, _m_block = _minute_freshness(minute_info, cfg)
-        allowed, block = _entry_allowed(risk)
+        flow_veto = str(row.get("flow_veto") or "")
+        allowed, block = _entry_allowed(risk, flow_veto)
         eligible = phase_code == PHASE_ENTRY and allowed
         entry_block = item.get("entry_block_reason") or ("" if allowed else block)
         row.update({
@@ -2825,7 +4214,7 @@ def evaluate_intersection_states(
             "new_open_eligible": eligible,
             "new_entry_allowed": allowed,
             "entry_block_reason": entry_block,
-            "risk_note": "" if risk_clean else f"公告风险仅观察({risk})",
+            "risk_note": risk_note_text(risk),
             "announcement_risk": risk,
             "risk_status": risk,
             "minute_data_fresh": fresh,
@@ -2928,7 +4317,7 @@ def evaluate_intersection_states(
             and is_number(flow5) and flow5 > 0
             and is_number(flow15) and flow15 > 0
             and resonance
-            and risk == RISK_CLEAN
+            and risk_allows_state_qualification(risk)   # avoid/unknown 一票否决；watch_risk 仅减分
         )
         if not fresh:
             retest_confirmed = False
@@ -2948,7 +4337,7 @@ def evaluate_intersection_states(
                 item["phase"] = PHASE_WAIT_RETEST    # 确认中断，回到等待并重新计数
                 return
             if count >= retest_need:                 # 连续第2次确认（不同快照）
-                allowed, block = _entry_allowed(risk)
+                allowed, block = _entry_allowed(risk, str(row.get("flow_veto") or ""))
                 if allowed and not past_deadline:    # 两次确认都必须在14:20前完成
                     item["phase"] = PHASE_ENTRY
                     item["entry_confirmed_at"] = now_text
@@ -3150,7 +4539,7 @@ def _sanitize_for_json(obj: Any) -> Any:
     return obj
 
 
-WATCHLIST_BREAKOUT_STATE_PATH = Path(__file__).resolve().parent / "watchlist_breakout_state.json"
+WATCHLIST_BREAKOUT_STATE_PATH = runtime_paths.state_file("watchlist_breakout_state.json")
 
 
 def load_watchlist_breakout_state() -> Dict[str, Dict[str, Any]]:
@@ -3165,13 +4554,16 @@ def load_watchlist_breakout_state() -> Dict[str, Dict[str, Any]]:
     return {}
 
 
-def save_watchlist_breakout_state(items: Dict[str, Dict[str, Any]], date_str: str) -> None:
-    """持久化保存观察池突破状态机。"""
-    try:
-        payload = {"date": date_str, "items": items}
-        WATCHLIST_BREAKOUT_STATE_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        pass
+def save_watchlist_breakout_state(
+    items: Dict[str, Dict[str, Any]],
+    date_str: str,
+    commit: Optional[state_commit.RoundCommit] = None,
+) -> None:
+    """持久化保存观察池突破状态机（临时文件 + os.replace 原子写入）。"""
+    payload = {"date": date_str, "items": items}
+    state_commit.write_or_stage(
+        commit, WATCHLIST_BREAKOUT_STATE_PATH, json.dumps(payload, ensure_ascii=False, indent=2)
+    )
 
 
 def evaluate_watchlist_breakout_states(
@@ -3268,6 +4660,14 @@ def evaluate_watchlist_breakout_states(
             breakout_class = "INVALID"
             confirm_count = 0
             status_note = f"公告风控 {RISK_AVOID} 否决"
+        elif risk == RISK_UNKNOWN:
+            # 公告 unknown 与 avoid 同为一票否决语义：可以继续展示“数据不足”的观察信息，
+            # 但不得输出 TRIGGERED/CONFIRMED/B_BREAKOUT/A_STRICT 等看似升级的状态
+            # （选股框架.md：公告 unknown 禁止正式买入建议）。
+            confirm_count = 0
+            cur_phase = "WATCHING"
+            breakout_class = "WATCHING"
+            status_note = "公告检查不可用（unknown），仅观察不升级"
         elif cur_price > no_chase_price:
             cur_phase = "OVER_CHASE"
             breakout_class = "WATCHING"
@@ -3311,7 +4711,7 @@ def evaluate_watchlist_breakout_states(
                             br_val = getattr(e, "buy_ratio", None) if e else None
                             buy_ratio = float(br_val) if (isinstance(br_val, (int, float)) and not math.isnan(br_val)) else None
 
-                            # A_STRICT 严格要求：绝对主导 + clean + 主力>=5% + 回落<1.5% + 主买比>=1.5（严禁缺数据放行）
+                            # A_STRICT 严格要求：绝对主导 + clean + 主力>=5% + 回落<1.5% + 主买比（代理值）>=1.5（严禁缺数据放行）
                             is_a_strict = (
                                 dom_type == "absolute" and
                                 risk == RISK_CLEAN and
@@ -3390,30 +4790,49 @@ def evaluate_watchlist_breakout_states(
 
 def build_watchlist(items: List[Enriched], stats: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
     breakout_cfg = RULE_CONFIG["screening"]["breakout"]
+    cfg = SCREENING_CONFIG["watchlist"]
     rows = []
     for e in items:
-        if not (5 <= e.price <= 45 and 3_000_000_000 <= e.float_mv <= 25_000_000_000):
+        if not (
+            float(cfg["price_min_inclusive"]) <= e.price <= float(cfg["price_max_inclusive"])
+            and float(cfg["float_mv_min_inclusive"]) <= e.float_mv <= float(cfg["float_mv_max_inclusive"])
+        ):
             continue
-        if not (e.price >= e.ma10 or e.price >= 0.97 * e.ma10):
+        if not (e.price >= e.ma10 or e.price >= float(cfg["ma10_repair_min_multiplier"]) * e.ma10):
             continue
-        if e.five_ret > 0.12 or e.dist60 > 0.15:
+        if e.five_ret > float(cfg["five_ret_max_inclusive"]) or e.dist60 > float(cfg["dist60_max_inclusive"]):
             continue
         if not has_resonance(e, stats):
             continue
-        if e.change > 5.2 or e.turnover > 9:
+        if e.change > float(cfg["change_max_exclusive"]) or e.turnover > float(cfg["turnover_max_exclusive"]):
             continue
         trigger = max(e.prior_high, e.high)
-        buy_low = max(e.ma5 * 0.995, e.ma10 * 0.99)
-        buy_high = max(e.ma5 * 1.01, e.ma10 * 1.005)
-        invalid = min(e.ma10 * 0.985, e.prior_low * 0.99)
+        buy_low = max(
+            e.ma5 * float(cfg["buy_low_ma5_multiplier"]),
+            e.ma10 * float(cfg["buy_low_ma10_multiplier"]),
+        )
+        buy_high = max(
+            e.ma5 * float(cfg["buy_high_ma5_multiplier"]),
+            e.ma10 * float(cfg["buy_high_ma10_multiplier"]),
+        )
+        invalid = min(
+            e.ma10 * float(cfg["invalid_ma10_multiplier"]),
+            e.prior_low * float(cfg["invalid_prior_low_multiplier"]),
+        )
         structure = "趋势低吸" if e.price > e.ma5 > e.ma10 and e.ma10 >= e.ma20 else "突破前观察"
-        score = 100 - abs(e.change - 3.2) * 8 - max(0, e.five_ret * 100 - 8) * 2 - max(0, e.dist60 * 100 - 8)
+        score = (
+            100
+            - abs(e.change - float(cfg["score_change_target"])) * float(cfg["score_change_scale"])
+            - max(0, e.five_ret * 100 - float(cfg["score_five_ret_free_pct"])) * float(cfg["score_five_ret_scale"])
+            - max(0, e.dist60 * 100 - float(cfg["score_dist60_free_pct"])) * float(cfg["score_dist60_scale"])
+        )
         rows.append({
             "score": round(score, 1),
             "code": e.code,
             "name": e.name,
             "price": e.price,
             "change": e.change,
+            "range_pct": e.range_pct,
             "industry": e.industry,
             "structure": structure,
             "trigger": round(trigger, 2),
@@ -3422,13 +4841,13 @@ def build_watchlist(items: List[Enriched], stats: Dict[str, Dict[str, Any]]) -> 
             "no_chase": f">{trigger * float(breakout_cfg['no_chase_multiplier']):.2f}不追",
             "reason": f"{e.industry}; 5日{e.five_ret*100:.1f}%; 距60高{e.dist60*100:.1f}%",
         })
-    return sorted(rows, key=lambda r: r["score"], reverse=True)[:10]
+    return sorted(rows, key=lambda r: r["score"], reverse=True)[: int(cfg["max_rows"])]
 
 
 def markdown_table(headers: List[str], rows: List[List[Any]]) -> str:
     if not rows:
         return "无"
-    align = ["---"] + ["---:" if h in {"涨幅", "换手率", "成交额", "量比", "高位回落", "近5日", "距20日线", "评分", "涨跌", "涨跌%", "主力净占比", "5分钟增量", "主力净额", "超大单", "大单", "中单", "小单", "15分钟增量", "板块内候选"} else "---" for h in headers[1:]]
+    align = ["---"] + ["---:" if h in {"涨幅", "换手率", "成交额", "量比", "高位回落", "近5日", "距20日线", "评分", "涨跌", "涨跌%", "主力净占比", "5分钟增量", "主力净额", "超大单", "大单", "中单", "小单", "15分钟增量", "板块内候选", "区间分位"} else "---" for h in headers[1:]]
     lines = ["| " + " | ".join(headers) + " |", "| " + " | ".join(align) + " |"]
     for row in rows:
         lines.append("| " + " | ".join(str(x) for x in row) + " |")
@@ -3439,6 +4858,41 @@ def render_markdown(result: Dict[str, Any]) -> str:
     lines: List[str] = []
     meta = result["meta"]
     lines.append(f"数据时间：{meta['timestamp']}，状态：{meta['status']}，耗时 {meta.get('elapsed_seconds', '?')}s。来源：{meta['source']}。")
+    background = result.get("market_background") or {}
+    calendar_info = background.get("calendar") if isinstance(background, dict) else None
+    if isinstance(calendar_info, dict):
+        calendar_status = calendar_info.get("status")
+        calendar_data = calendar_info.get("data") or {}
+        if calendar_status == "ok" and isinstance(calendar_data, dict):
+            day_label = "交易日" if calendar_data.get("is_open") else "休市日"
+            lines.append(f"交易日历：{day_label}（深交所官方整月日历，数据日 {calendar_info.get('data_date') or background.get('data_date') or '-'}）。")
+        else:
+            lines.append("交易日历：待确认（官方整月日历不可用或未发布；未据此推进状态机/T+1）。")
+    sentiment_info = background.get("sentiment") if isinstance(background, dict) else None
+    if isinstance(sentiment_info, dict):
+        metrics = ((sentiment_info.get("data") or {}).get("metrics") if isinstance(sentiment_info.get("data"), dict) else None) or {}
+        if sentiment_info.get("status") in {"ok", "partial"} and metrics:
+            lines.append(
+                "市场情绪（背景摘要，仅统计已取范围）："
+                f"涨停 {metrics.get('limit_up_count', 0)} / 炸板 {metrics.get('broken_count', 0)} / 跌停 {metrics.get('limit_down_count', 0)}；"
+                f"炸板率 {metrics.get('break_rate') if metrics.get('break_rate') is not None else '不适用'}%；"
+                f"最高连板 {metrics.get('max_streak') or '未取到'}；"
+                f"昨涨停今日平均 {metrics.get('yesterday_limit_up_today_average_change_pct') if metrics.get('yesterday_limit_up_today_average_change_pct') is not None else '不适用'}%。"
+                f"范围={metrics.get('scope', '未知')}，时点={metrics.get('as_of') or '-'}。"
+            )
+        else:
+            lines.append("市场情绪：不可用/待确认；不把失败当作空池，也不改变现有评分和权限。")
+    # 交易板范围：报告必须能追溯本轮实际筛了什么范围，避免把扩展板沉默地混进主板结论。
+    if meta.get("enabled_boards_label"):
+        lines.append(
+            f"筛选范围（交易板）：{meta['enabled_boards_label']}"
+            + ("（默认，仅沪深主板）" if list(meta.get("enabled_boards") or []) == [BOARD_MAIN] else "")
+            + "；所选交易板统一参与正式筛选（同一门槛、同一排名、同一条状态机）。"
+        )
+    # 范围结论在结果顶层（引擎/CLI 同位置），旧结果可能把它放在 meta 里。
+    scope_note = result.get("board_scope_note") or meta.get("board_scope_note")
+    if scope_note:
+        lines.append(scope_note)
     b = result["breadth"]
     fetch_status = result.get("market_fetch_status") or {}
     if fetch_status.get("source") == "sina_fallback":
@@ -3504,8 +4958,8 @@ def render_markdown(result: Dict[str, Any]) -> str:
 
     if result.get("capital_rank"):
         rows = [[
-            r["capital_class"], r.get("pool_source", ""), r["code"], r["name"], _fmt(r.get("price")),
-            pct(r.get("change")), f"{_fmt(r.get('capital_score'), 1)}",
+            r["capital_class"], r.get("pool_source", ""), r["code"], r["name"], r.get("board_label", ""), _fmt(r.get("price")),
+            pct(r.get("change")), range_position_cell(r), f"{_fmt(r.get('capital_score'), 1)}",
             flow_amount_str(r.get("main_net", 0)), f"{r.get('main_pct', 0):.1f}%",
             flow_amount_str(r.get("super_net", 0)),
             flow_amount_str(r.get("flow_5m_inc", float('nan'))),
@@ -3513,14 +4967,14 @@ def render_markdown(result: Dict[str, Any]) -> str:
             r.get("capital_data", ""), r.get("capital_reason", ""),
         ] for r in result["capital_rank"]]
         lines += ["", "## 主力资金优选（候选池二次排序）", markdown_table(
-            ["资金类", "原始来源", "代码", "名称", "现价", "涨幅", "资金评分", "主力净额",
+            ["资金类", "原始来源", "代码", "名称", "交易板", "现价", "涨幅", "区间分位", "资金评分", "主力净额",
              "主力净占比", "超大单", "5分钟增量", "均价线", "板块共振",
              "数据完整度", "评分依据"], rows)]
 
     raw_dual_pool = result.get("dual_pool_raw") if "dual_pool_raw" in result else result.get("dual_pool") or []
     if raw_dual_pool:
-        rows = [[r["code"], r["name"], _fmt(r.get("price")), pct(r["change"]), pct(r["turnover"]), amount_yi(r["amount"]), r["industry"], f"{r.get('main_pct',0):.1f}%", r.get("flow_status", ""), announcement_label(r)] for r in raw_dual_pool]
-        lines += ["", "## 双池交集（超短池 ∩ 趋势确认池，启动事件）", "注：交集仅代表启动确认，不是买点；真正买点由交集后的缩量回踩产生（见下方状态机）。", markdown_table(["代码", "名称", "现价", "涨幅", "换手率", "成交额", "板块", "主力净占比", "资金状态", "公告风险"], rows)]
+        rows = [[r["code"], r["name"], r.get("board_label", ""), _fmt(r.get("price")), pct(r["change"]), range_position_cell(r), pct(r["turnover"]), amount_yi(r["amount"]), r["industry"], f"{r.get('main_pct',0):.1f}%", flow_status_cell(r), announcement_label(r)] for r in raw_dual_pool]
+        lines += ["", "## 双池交集（超短池 ∩ 趋势确认池，启动事件）", "注：交集仅代表启动确认，不是买点；真正买点由交集后的缩量回踩产生（见下方状态机）。", markdown_table(["代码", "名称", "交易板", "现价", "涨幅", "区间分位", "换手率", "成交额", "板块", "主力净占比", "资金状态", "公告风险"], rows)]
     elif "dual_pool" in result:
         lines += ["", "## 双池交集（超短池 ∩ 趋势确认池，启动事件）", "无"]
 
@@ -3545,30 +4999,30 @@ def render_markdown(result: Dict[str, Any]) -> str:
         # ── 准交集预警 ──
         if pre_rows_md:
             pre_table = [[
-                r.get("code", ""), r.get("name", ""), f"{r.get('price', 0):.2f}", pct(r.get("change")),
+                r.get("code", ""), r.get("name", ""), r.get("board_label", ""), f"{r.get('price', 0):.2f}", pct(r.get("change")),
                 r.get("intersection_phase", ""),
                 r.get("preintersection_missing", "-"),
                 (f"{r['trigger_price']:.2f}" if is_number(r.get("trigger_price")) else "—"),
-                f"{r.get('main_pct', 0):.1f}%", r.get("flow_status", ""), r.get("resonance", "否"),
+                f"{r.get('main_pct', 0):.1f}%", flow_status_cell(r), r.get("resonance", "否"),
                 r.get("risk_note") or announcement_label(r),
             ] for r in pre_rows_md if r.get("intersection_phase") in ("准交集", "等待转强")]
             if pre_table:
-                lines += ["", "### 【准交集预警】", "距趋势确认仅差1项 + 四道门槛（主力净流入/5分资金正/均价线上/板块共振）全部通过。公告风险非clean者仅观察，不给新开仓资格。", markdown_table(
-                    ["代码", "名称", "现价", "涨幅", "相位", "缺失条件", "预计触发价", "主力净占比", "资金状态", "板块共振", "公告风险"], pre_table)]
+                lines += ["", "### 【准交集预警】", "距趋势确认仅差1项，并通过主力净额、5分钟资金和均价线前置检查；板块共振在此阶段用于参考，不单独否决。准交集仍是观察信号。公告 avoid/unknown 一票否决（不给新开仓资格），watch_risk 仅减分。", markdown_table(
+                    ["代码", "名称", "交易板", "现价", "涨幅", "相位", "缺失条件", "预计触发价", "主力净占比", "资金状态", "板块共振", "公告风险"], pre_table)]
             # 被前置门槛排除的标的：透明输出未通过门槛，便于核对
             excluded_table = [[
-                r.get("code", ""), r.get("name", ""), f"{r.get('price', 0):.2f}", pct(r.get("change")),
+                r.get("code", ""), r.get("name", ""), r.get("board_label", ""), f"{r.get('price', 0):.2f}", pct(r.get("change")),
                 r.get("preintersection_missing", "-"),
                 r.get("gate_failure_text", "-"),
             ] for r in pre_rows_md if r.get("intersection_phase") == "观察中"]
             if excluded_table:
-                lines += ["", "### 【观察中·门槛未过】", "趋势条件只差1项但四道前置门槛未全过，不进入准交集预警。", markdown_table(
-                    ["代码", "名称", "现价", "涨幅", "缺失趋势条件", "未通过前置门槛"], excluded_table)]
+                lines += ["", "### 【观察中·门槛未过】", "趋势条件只差1项，但前置门槛（主力净额/5分钟资金/均价线）未全过，不进入准交集预警。板块共振不单独否决。", markdown_table(
+                    ["代码", "名称", "交易板", "现价", "涨幅", "缺失趋势条件", "未通过前置门槛"], excluded_table)]
         # ── 已触发·等待回踩 ──
         active_states = [r for r in state_rows if r.get("late_flag") is not True and r.get("intersection_phase") in ("首次交集", "等待回踩", "回踩确认", "可试错")]
         if active_states:
             act_table = [[
-                r.get("code", ""), r.get("name", ""), r.get("first_intersection_at", ""),
+                r.get("code", ""), r.get("name", ""), r.get("board_label", ""), r.get("first_intersection_at", ""),
                 (f"{r['trigger_price']:.2f}" if is_number(r.get("trigger_price")) else "—"),
                 (f"{r['trigger_vwap']:.2f}" if is_number(r.get("trigger_vwap")) else "—"),
                 flow_amount_str(r.get("trigger_flow_5m")) if is_number(r.get("trigger_flow_5m")) else "—",
@@ -3577,34 +5031,34 @@ def render_markdown(result: Dict[str, Any]) -> str:
                 r.get("failure_reason", "-"),
             ] for r in active_states]
             lines += ["", "### 【已触发·等待回踩】", "交集后不追，等待缩量回踩至回踩区且5分资金仍正，方为买点。", markdown_table(
-                ["代码", "名称", "交集时间", "触发价", "当时VWAP", "5分资金", "回踩观察区", "相位", "有效性", "失效原因"], act_table)]
+                ["代码", "名称", "交易板", "交集时间", "触发价", "当时VWAP", "5分资金", "回踩观察区", "相位", "有效性", "失效原因"], act_table)]
         # ── 迟到交集 ──
         late_states = [r for r in state_rows if r.get("late_flag") is True]
         if late_states:
             late_table = [[
-                r.get("code", ""), r.get("name", ""), pct(r.get("change")),
+                r.get("code", ""), r.get("name", ""), r.get("board_label", ""), pct(r.get("change")),
                 "；".join(r.get("late_reasons", []) or []) or "无",
             ] for r in late_states]
             lines += ["", "### 【迟到交集·不追】", "首次交集即过热/无共振，已标记迟到，不提供买点。", markdown_table(
-                ["代码", "名称", "涨幅", "迟到原因"], late_table)]
+                ["代码", "名称", "交易板", "涨幅", "迟到原因"], late_table)]
         if not (pre_rows_md or active_states or late_states):
             lines.append("无（当前无准交集预警，也无正式交集；不为了制造信号而放宽原池条件）")
 
     if result.get("strict_enabled"):
-        rows = [[r["code"], r["name"], _fmt(r.get("price")), pct(r["change"]), pct(r["turnover"]), amount_yi(r["amount"]), _fmt(r.get("volume_ratio")), r["industry"], f"{r.get('main_pct',0):.1f}%", flow_amount_str(r.get("flow_5m_inc",0)), r.get("flow_status",""), announcement_label(r)] for r in result["strict_ultra"]]
-        content = markdown_table(["代码", "名称", "现价", "涨幅", "换手率", "成交额", "量比", "板块", "主力净占比", "5分钟增量", "资金状态", "公告风险"], rows)
+        rows = [[r["code"], r["name"], r.get("board_label", ""), _fmt(r.get("price")), pct(r["change"]), pct(r["turnover"]), amount_yi(r["amount"]), _fmt(r.get("volume_ratio")), r["industry"], f"{r.get('main_pct',0):.1f}%", flow_amount_str(r.get("flow_5m_inc",0)), flow_status_cell(r), announcement_label(r)] for r in result["strict_ultra"]]
+        content = markdown_table(["代码", "名称", "交易板", "现价", "涨幅", "换手率", "成交额", "量比", "板块", "主力净占比", "5分钟增量", "资金状态", "公告风险"], rows)
         if not rows:
             content = "无（当前没有满足超短池硬条件的标的）"
         lines += ["", "## 超短池", content]
     if result.get("strict_enabled"):
-        rows = [[r["code"], r["name"], _fmt(r.get("price")), pct(r["change"]), pct(r["turnover"]), amount_yi(r["amount"]), r["industry"], r.get("ma_state", ""), f"{r.get('main_pct',0):.1f}%", flow_amount_str(r.get("flow_5m_inc",0)), r.get("flow_status",""), announcement_label(r)] for r in result.get("trend_observation") or []]
-        content = markdown_table(["代码", "名称", "现价", "涨幅", "换手率", "成交额", "板块", "均线状态", "主力净占比", "5分钟增量", "资金状态", "公告风险"], rows)
+        rows = [[r["code"], r["name"], r.get("board_label", ""), _fmt(r.get("price")), pct(r["change"]), pct(r["turnover"]), amount_yi(r["amount"]), r["industry"], r.get("ma_state", ""), f"{r.get('main_pct',0):.1f}%", flow_amount_str(r.get("flow_5m_inc",0)), flow_status_cell(r), announcement_label(r)] for r in result.get("trend_observation") or []]
+        content = markdown_table(["代码", "名称", "交易板", "现价", "涨幅", "换手率", "成交额", "板块", "均线状态", "主力净占比", "5分钟增量", "资金状态", "公告风险"], rows)
         if not rows:
             content = "无（当前没有满足趋势观察条件的标的）\n\n说明：不以放宽趋势确认来凑数。"
         lines += ["", "## 趋势观察池", content]
     if result.get("strict_enabled"):
-        rows = [[r["code"], r["name"], _fmt(r.get("price")), pct(r["change"]), pct(r["turnover"]), amount_yi(r["amount"]), r["industry"], f"{r.get('main_pct',0):.1f}%", flow_amount_str(r.get("flow_5m_inc",0)), r.get("flow_status",""), announcement_label(r)] for r in result["strict_trend"]]
-        content = markdown_table(["代码", "名称", "现价", "涨幅", "换手率", "成交额", "板块", "主力净占比", "5分钟增量", "资金状态", "公告风险"], rows)
+        rows = [[r["code"], r["name"], r.get("board_label", ""), _fmt(r.get("price")), pct(r["change"]), pct(r["turnover"]), amount_yi(r["amount"]), r["industry"], f"{r.get('main_pct',0):.1f}%", flow_amount_str(r.get("flow_5m_inc",0)), flow_status_cell(r), announcement_label(r)] for r in result["strict_trend"]]
+        content = markdown_table(["代码", "名称", "交易板", "现价", "涨幅", "换手率", "成交额", "板块", "主力净占比", "5分钟增量", "资金状态", "公告风险"], rows)
         if not rows:
             content = "无（当前没有满足趋势确认硬条件的标的）"
         lines += ["", "## 趋势确认池", content]
@@ -3625,17 +5079,17 @@ def render_markdown(result: Dict[str, Any]) -> str:
     if result.get("low_ultra"):
         ind_counts = Counter(r.get("industry", "") for r in result["low_ultra"])
         rows = [[
-            r["class"], r["code"], r["name"], _fmt(r.get("price")), pct(r["change"]), pct(r["turnover"]),
+            r["class"], r["code"], r["name"], r.get("board_label", ""), _fmt(r.get("price")), pct(r["change"]), range_position_cell(r), pct(r["turnover"]),
             amount_yi(r["amount"]), _fmt(r.get("volume_ratio")), r["industry"], ind_counts.get(r.get("industry", ""), 0),
             r["resonance"], f"{_fmt(r.get('high_pull'))}pct", r["vwap_state"], f"{r.get('main_pct',0):.1f}%",
             flow_amount_str(r.get("super_net", 0)),
             r.get("dominance_label") or r.get("super_lead") or "未计算",
-            flow_amount_str(r.get("flow_5m_inc", 0)), r.get("flow_status", ""), r["risk"], announcement_label(r),
+            flow_amount_str(r.get("flow_5m_inc", 0)), flow_status_cell(r), r["risk"], announcement_label(r),
         ] for r in result["low_ultra"]]
-        lines += ["", "## 低吸超短线 A/B/C", markdown_table(["类", "代码", "名称", "现价", "涨幅", "换手率", "成交额", "量比", "板块", "板块内候选", "共振", "高位回落", "均价线", "主力净占比", "超大单", "超单主导", "5分钟增量", "资金状态", "风险", "公告风险"], rows)]
+        lines += ["", "## 低吸超短线 A/B/C", markdown_table(["类", "代码", "名称", "交易板", "现价", "涨幅", "区间分位", "换手率", "成交额", "量比", "板块", "板块内候选", "共振", "高位回落", "均价线", "主力净占比", "超大单", "超单主导", "5分钟增量", "资金状态", "风险", "公告风险"], rows)]
     if result.get("low_trend"):
-        rows = [[r["class"], r["code"], r["name"], _fmt(r.get("price")), pct(r["change"]), pct(r["turnover"]), amount_yi(r["amount"]), r["industry"], r["ma_state"], pct((r.get("five_ret") or 0) * 100), pct((r.get("ma20_dist") or 0) * 100), f"{_fmt(r.get('high_pull'))}pct", f"{r.get('main_pct',0):.1f}%", flow_amount_str(r.get("flow_5m_inc",0)), r.get("flow_status",""), r["risk"], announcement_label(r)] for r in result["low_trend"]]
-        lines += ["", "## 低吸短线趋势 A/B/C", markdown_table(["类", "代码", "名称", "现价", "涨幅", "换手率", "成交额", "板块", "均线状态", "近5日", "距20日线", "高位回落", "主力净占比", "5分钟增量", "资金状态", "风险", "公告风险"], rows)]
+        rows = [[r["class"], r["code"], r["name"], r.get("board_label", ""), _fmt(r.get("price")), pct(r["change"]), range_position_cell(r), pct(r["turnover"]), amount_yi(r["amount"]), r["industry"], r["ma_state"], pct((r.get("five_ret") or 0) * 100), pct((r.get("ma20_dist") or 0) * 100), f"{_fmt(r.get('high_pull'))}pct", f"{r.get('main_pct',0):.1f}%", flow_amount_str(r.get("flow_5m_inc",0)), flow_status_cell(r), r["risk"], announcement_label(r)] for r in result["low_trend"]]
+        lines += ["", "## 低吸短线趋势 A/B/C", markdown_table(["类", "代码", "名称", "交易板", "现价", "涨幅", "区间分位", "换手率", "成交额", "板块", "均线状态", "近5日", "距20日线", "高位回落", "主力净占比", "5分钟增量", "资金状态", "风险", "公告风险"], rows)]
     if result.get("low_open_wash"):
         rows = [[
             r["code"], r["name"],
@@ -3652,14 +5106,73 @@ def render_markdown(result: Dict[str, Any]) -> str:
         lines += ["", "## 低开洗盘（实验性观察补充 · 不计入主/次级信号 · 永不自动出手）",
                    "> ⚠️ 不在 7/30 收敛核心框架内。条件：低开≥2% + 翻红 + 站上均价线 + 当日主力净流入正 + 20日持续净流入。匹配即进观察，不参与主/次级判定，也绝不自动出手。",
                    markdown_table(["代码", "名称", "今开", "昨收", "低开%", "现价/涨幅", "主力净占比", "5分钟增量", "均价线", "20日累计净流入", "板块", "公告风险"], rows)]
+    # 历史快照兼容：旧结果带独立「扩展交易板观察」列表时按原口径原样渲染，
+    # **不把旧结果重新解释成完整筛选结果**。新结果不再有这一节——三板都进正式栏目。
+    if "extended_board_observations" in result:
+        legacy_status = result.get("extended_board_status", "ok")
+        legacy_rows = result.get("extended_board_observations") or []
+        lines += ["", "## 扩展交易板观察（历史口径 · 该快照生成时两板仅观察）",
+                  "> ⚠️ 本快照由旧口径生成：创业板/科创板当时只进观察列表、不参与正式池。"
+                  "当前设置已是「所选交易板统一参与正式筛选」，勿按本表判断候选强弱。"]
+        if legacy_status != "ok":
+            lines.append("> ⚠️ 该快照当轮数据不可用，未产出观察列表。")
+        elif not legacy_rows:
+            lines.append("无")
+        else:
+            lines.append(markdown_table(
+                ["交易板", "代码", "名称", "现价", "涨幅", "换手率", "成交额", "量比"],
+                [[r.get("board_label", ""), r.get("code", ""), r.get("name", ""),
+                  _fmt(r.get("price")), f"{_fmt(r.get('change'))}%",
+                  f"{_fmt(r.get('turnover'))}%", flow_amount_str(r.get("amount")),
+                  _fmt(r.get("vol_ratio"), 2)] for r in legacy_rows]))
+
+    if meta.get("negative_super_view") == "observe":
+        neg_status = result.get("negative_super_status", "ok")
+        neg_rows = result.get("negative_super_observations") or []
+        lines += ["", "## 负超单观察（独立列表 · 仅观察 · 真实仓一票否决不变）"]
+        if neg_status != "ok":
+            reason = {"degraded": "行情降级（新浪备用源）", "incomplete": "行情快照不完整"}.get(
+                neg_status, neg_status)
+            lines.append(
+                f"> ⚠️ {reason}，本轮未产出负超单观察列表；列表为空不代表“今天没有负超单标的”。"
+            )
+        elif not neg_rows:
+            lines.append("无")
+        else:
+            rows = [[
+                r.get("code", ""), r.get("name", ""), r.get("data_time", ""),
+                flow_amount_str(r.get("super_net", 0)),
+                flow_amount_str(r.get("main_net", 0)),
+                flow_amount_str(r.get("big_net", 0)),
+                flow_amount_str(r.get("flow_5m_inc", float("nan"))),
+                f"{_fmt(r.get('price'))} / {r.get('vwap_state', '')}",
+                r.get("resonance", "否"),
+                r.get("dominance_label", "✗"),
+                r.get("flow_status", ""),
+                announcement_label(r),
+                "；".join(r.get("blockers") or []),
+                shadow_badge_text(r.get("shadow_badge")),
+            ] for r in neg_rows]
+            lines.append("> ⚠️ 仅观察，真实仓一票否决不变；逐项未通过门槛如实列出，不得当作“仅差一个条件即可买”。")
+            lines.append(markdown_table(
+                ["代码", "名称", "数据时间", "超大单", "主力净额", "大单净额", "5分钟增量",
+                 "现价/均价线", "板块共振", "生产主导标签", "资金状态", "公告风险",
+                 "未通过门槛", "影子徽标"], rows))
     if result.get("watchlist"):
+        # 观察池突破状态机只在 CLI 路径运行；实时看板链路不产出 breakout_phase。
+        # 未评估时如实标「未评估 / —」，不默认 WATCHING、0次、✗（那等于伪造状态）。
+        breakout_evaluated = any(r.get("breakout_phase") for r in result["watchlist"])
         rows = [[
-            r["code"], r["name"], _fmt(r.get("price")), pct(r.get("change")), r["industry"], r["structure"],
-            r["trigger"], r.get("breakout_phase", "WATCHING"), f"{r.get('confirm_count', 0)}次",
-            r.get("dominance_label", "✗"), r["buy_zone"], r["invalid"], r["no_chase"],
-            r.get("status_note", ""), announcement_label(r)
+            r["code"], r["name"], r.get("board_label", ""), _fmt(r.get("price")), pct(r.get("change")), range_position_cell(r), r["industry"], r["structure"],
+            r["trigger"], r.get("breakout_phase") or "未评估",
+            (f"{r['confirm_count']}次" if r.get("confirm_count") is not None else "—"),
+            r.get("dominance_label") or "—", r["buy_zone"], r["invalid"], r["no_chase"],
+            (r.get("status_note", "") or "") + flow_veto_suffix(r), announcement_label(r)
         ] for r in result["watchlist"]]
-        lines += ["", "## 明日观察池（含突破升级状态机）", markdown_table(["代码", "名称", "当前价", "涨幅", "板块", "结构", "触发价", "突破状态", "确认次数", "超单主导", "低吸区", "失效", "追高禁区", "状态说明", "公告风险"], rows)]
+        watchlist_title = (
+            "## 明日观察池（含突破升级状态机）" if breakout_evaluated else "## 明日观察池"
+        )
+        lines += ["", watchlist_title, markdown_table(["代码", "名称", "交易板", "当前价", "涨幅", "区间分位", "板块", "结构", "触发价", "突破状态", "确认次数", "超单主导", "低吸区", "失效", "追高禁区", "状态说明", "公告风险"], rows)]
     if result.get("sector_indices"):
         sectors = sorted(result["sector_indices"], key=lambda s: s["change"], reverse=True)
         rows = [[s["name"], pct(s["change"]), f"{s['price']:.2f}" if s.get("price") else "-",
@@ -3684,7 +5197,7 @@ def render_markdown(result: Dict[str, Any]) -> str:
                 flow_amount_str(r.get("flow_15m_inc", 0)),
                 vwap_label,
                 r.get("industry", ""),
-                r.get("flow_status", ""),
+                flow_status_cell(r),
             ])
         lines += ["", "## 重点候选资金追踪", markdown_table(
             ["代码", "名称", "主力净额", "主力净占比", "超大单", "大单", "中单", "小单",
@@ -3693,89 +5206,319 @@ def render_markdown(result: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="A-share screening query helper for daily-stock-analysis")
-    parser.add_argument("--mode", nargs="+", choices=["all", "strict", "low", "watchlist"], default=["strict"], help="screening modules to output (default: original dual screen)")
-    parser.add_argument("--format", choices=["md", "json"], default="md", help="output format")
-    parser.add_argument("--workers", type=int, default=6, help="concurrent K-line workers")
-    parser.add_argument("--top", type=int, default=10, help="max rows per section")
-    parser.add_argument("--save", type=Path, help="also save output to file")
-    parser.add_argument("--skip-announcements", action="store_true", help="skip latest-announcement risk check")
-    parser.add_argument("--skip-capital-ranking", action="store_true", help="skip capital-flow secondary ranking")
-    parser.add_argument("--announcement-page-size", type=int, default=8, help="latest announcement rows per stock")
-    parser.add_argument("--network-mode", choices=["auto", "direct", "proxy"], default="auto",
-                        help="connection strategy: auto (measure latency of direct+proxy paths, pick fastest), direct, or proxy")
-    args = parser.parse_args()
-    set_network_mode(args.network_mode)
-    MARKET_WARNINGS.clear()
 
-    # Normalize mode list: "all" expands to all three individual modules
-    modes = set(args.mode)
+# 需要在每行标注交易板的正式栏目（与公告检查的可见栏目清单一致，另含双池明细与状态机）
+BOARD_STAMPED_SECTIONS = (
+    "strict_ultra", "trend_observation", "strict_trend", "dual_pool", "dual_pool_raw",
+    "capital_rank", "low_ultra", "low_trend", "watchlist", "pre_intersection",
+    "intersection_states", "negative_super_observations",
+)
+
+
+def stamp_board_fields(result: Dict[str, Any]) -> None:
+    """给各正式栏目每一行补上「交易板」字段（由代码判定，不依赖行内已有值）。
+
+    创业板/科创板加入正式筛选后，同一张表里会同时出现三板的股票，
+    因此每行都必须能看出它属于哪个交易板；用 setdefault 保留既有值，
+    便于历史快照按原样渲染。
+    """
+    for section in BOARD_STAMPED_SECTIONS:
+        for row in result.get(section) or []:
+            if not isinstance(row, dict):
+                continue
+            board = board_of(row.get("code") or row.get("f12"))
+            row.setdefault("board", board)
+            row.setdefault("board_label", BOARD_LABELS.get(board, board))
+
+
+def board_scope_note(status: str, selected: Any, candidate_total: int) -> str:
+    """本轮范围的结论说明：必须能区分「未符合条件」与「数据不可用」。
+
+    ``candidate_total`` 是本轮所选交易板范围内各候选池**去重后的候选股票数**
+    （CLI 与实时引擎同一口径）。数据完整且为 0 时才是「没有符合现有门槛的候选」；
+    数据降级/不完整时无论是否为 0 都只能报「本轮结果不完整」。
+    """
+    boards = normalize_boards(selected)
+    label = " + ".join(BOARD_LABELS.get(board, board) for board in boards)
+    if status != "ok":
+        reason = {"degraded": "行情降级（备用源，字段不完整）", "incomplete": "行情快照不完整"}.get(status, status)
+        return f"筛选范围：{label}；{reason}，本轮结果不完整——无候选不等于「未符合条件」。"
+    if candidate_total == 0:
+        return f"筛选范围：{label}；数据完整，本轮该范围内没有符合现有门槛的候选（正常筛选结果）。"
+    return f"筛选范围：{label}；数据完整，本轮范围内产生 {candidate_total} 条候选。"
+
+
+def load_holding_codes() -> set:
+    """读取本机持仓文件里的股票代码。
+
+    只用于「取消某个交易板后，已持仓股票的监控不能停」这一条；不参与任何买入判定。
+    文件结构可能变化，因此递归找 6 位代码，而不是依赖固定字段名。
+    """
+    path = SCRIPT_DIR / "holdings.json"
+    codes: set = set()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return codes
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+        elif isinstance(node, str):
+            text = node.strip()
+            if text.isdigit() and len(text) == 6:
+                codes.add(text)
+
+    walk(payload)
+    return codes
+
+
+def prune_state_by_boards(
+    items: Dict[str, Any], boards: Any = (BOARD_MAIN,), keep_codes: Any = ()
+) -> Dict[str, Any]:
+    """把**不在所选交易板内**的旧候选从连续状态里剔除。
+
+    切换交易板范围后，旧范围留下的锁存/等待回踩/突破状态不能继续生效（否则等于绕过了
+    本次范围设置）；但已持仓股票必须保留——监控不能因为取消某个交易板而停止。
+    """
+    selected = set(normalize_boards(boards))
+    keep = {str(code) for code in (keep_codes or ())}
+    return {
+        str(code): item
+        for code, item in (items or {}).items()
+        if str(code) in keep or board_of(code) in selected
+    }
+
+
+def count_by_board(rows: List[Any]) -> Dict[str, int]:
+    """按板别计数；命中不了的归入 unknown（用于报告/meta 的口径记录）。"""
+    counts = {board: 0 for board in BOARD_ORDER}
+    counts[BOARD_UNKNOWN] = 0
+    for item in rows:
+        code = item.get("f12") if isinstance(item, dict) else getattr(item, "code", None)
+        counts[board_of(code)] = counts.get(board_of(code), 0) + 1
+    return counts
+
+
+def board_scope_status_for(
+    fallback_snapshot: bool, fetch_status: Optional[Dict[str, Any]] = None
+) -> str:
+    """本轮交易板范围结果的可用性判定（CLI 与引擎共用同一口径，避免各自缺省成 ok）。
+
+    - ``degraded``：行情走了新浪备用源（字段降级）；
+    - ``incomplete``：快照分页不完整；
+    - ``ok``：可产出所选交易板的正式筛选结果。
+
+    降级/不完整时结果不可用，报告要区分「未符合条件」与「数据不可用」。
+    """
+    if fallback_snapshot:
+        return "degraded"
+    if (fetch_status or {}).get("complete") is False:
+        return "incomplete"
+    return "ok"
+
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 共享筛选核心
+#
+# CLI（本文件 main）与看板/工作台（realtime_engine.run_screening）都调用
+# run_screening_core。规则计算、公告门禁、资金排名、两条状态机只在这里跑一次，
+# 避免两套实现漂移。入口差异（网络模式、K 线缓存、进度回调、分钟量能、温度计）
+# 通过 ScreeningHooks 显式注入，不靠调用方身份分支，也不 monkey-patch 全局函数。
+#
+# ``top`` 只影响本函数最后的展示裁剪；完整候选集合、公告核验范围、双池交集、
+# 准交集、观察池突破与交集状态推进一律读全量内部集合。
+# ══════════════════════════════════════════════════════════════════════════
+
+
+@dataclass(frozen=True)
+class ScreeningParams:
+    """一次筛选的机器参数（CLI、看板、工作台共用同一套）。"""
+
+    modes: frozenset
+    workers: int = 6
+    top: int = 10
+    skip_announcements: bool = False
+    skip_capital_ranking: bool = False
+    network_mode: str = "auto"
+    announcement_page_size: int = 8
+    enabled_boards: Tuple[str, ...] = (BOARD_MAIN,)
+
+
+@dataclass
+class ScreeningHooks:
+    """入口差异注入点。
+
+    - ``state_commit``：运行状态提交门。非空时资金基准/交集状态/观察池突破状态
+      只暂存，由调度器在确认本轮有效后统一提交；超时/失败的一轮不得落盘。
+    - ``fetch_kline_fn``：K 线取数（看板注入带缓存与限速的实现）。
+    - ``build_extras``：公告核验前追加的看板专有列表（如负超单观察），其行会被
+      同一份公告查询覆盖。
+    - ``minute_map_provider``：状态机分钟线输入（看板专有）。市场环境分级在核心内
+      统一计算，不再由入口注入。
+    """
+
+    announce_progress: Optional[Callable[[int, int, str, str, str], None]] = None
+    state_commit: Optional[state_commit.RoundCommit] = None
+    fetch_kline_fn: Optional[Callable[..., Any]] = None
+    source_suffix: str = ""
+    extra_meta: Any = None                      # dict 或返回 dict 的可调用对象
+    build_extras: Optional[Callable[..., Dict[str, Any]]] = None
+    save_kline_cache: Optional[Callable[[], None]] = None
+    minute_map_provider: Optional[Callable[..., Dict[str, Any]]] = None
+    on_enriched: Optional[Callable[[Dict[str, "Enriched"]], None]] = None
+    snapshot_id: Optional[str] = None
+    log: Optional[Callable[[str], None]] = None
+
+    def log_line(self, message: str) -> None:
+        if self.log is not None:
+            try:
+                self.log(message)
+            except Exception:
+                pass
+
+
+def _display_rows(rows: Optional[List[Dict[str, Any]]], top: int) -> List[Dict[str, Any]]:
+    """展示截取：只改变可见行数，不改变任何上游计算结果。"""
+    if not rows:
+        return []
+    return list(rows[: max(0, int(top))])
+
+
+def run_screening_core(
+    params: ScreeningParams,
+    hooks: Optional[ScreeningHooks] = None,
+) -> Dict[str, Any]:
+    """执行一次完整筛选并返回核心结果。
+
+    阶段固定为：行情与质量判定 → 丰富数据 → 资金基准/否决 → 完整候选池 →
+    公告核验及风险映射 → 资金排名 → 观察池突破 → 双池交集/准交集 →
+    交集状态机 → 展示裁剪。看板专有的分钟量能、温度计、进出场建议由调用方附加。
+
+    行情不可用时抛 ``NetworkUnavailable``，由调用方决定输出形式。
+    """
+    hooks = hooks or ScreeningHooks()
+    modes = set(params.modes)
     if "all" in modes:
         modes = {"strict", "low", "watchlist"}
+    if not modes:
+        modes = {"strict"}
+
+    set_network_mode(params.network_mode)
+    MARKET_WARNINGS.clear()
 
     t0 = time.time()
-    try:
-        market, total = fetch_market()
-    except NetworkUnavailable as exc:
-        print(format_network_failure(exc), file=sys.stderr)
-        return 2
-    t_market = time.time() - t0
-    print(f"[计时] 行情分页: {t_market:.1f}s  ({len(market)} 条)", file=sys.stderr)
+    market, total = fetch_market()
     market_fetch_status = get_market_fetch_status()
     fallback_snapshot = market_fetch_status.get("source") == "sina_fallback"
+    hooks.log_line(f"[计时] 行情分页: {time.time() - t0:.1f}s  ({len(market)} 条)")
+
     if fallback_snapshot:
-        indices_raw = []
-        sector_boards = []
+        indices_raw: List[Dict[str, Any]] = []
+        sector_boards: List[Dict[str, Any]] = []
         MARKET_WARNINGS.append("备用行情模式跳过东方财富指数和板块接口，避免主源故障导致二次等待")
     else:
         indices_raw = fetch_indices()
         sector_boards = fetch_sector_indices()
-    prefetch = filter_prefetch(market, args.mode)
-    enriched, errors = enrich_all(prefetch, max(1, args.workers))
-    t_enrich = time.time() - t0 - t_market
-    print(f"[计时] K线增强: {t_enrich:.1f}s  ({len(enriched)} 只)", file=sys.stderr)
+
+    boards_in_use = normalize_boards(params.enabled_boards)
+    mode_list = ["all"] if modes == {"strict", "low", "watchlist"} else sorted(modes)
+    prefetch = filter_prefetch(market, mode_list, boards=boards_in_use)
+    enriched, errors = enrich_all(prefetch, max(1, params.workers), hooks.fetch_kline_fn)
+    hooks.log_line(f"[计时] K线增强: {time.time() - t0:.1f}s  ({len(enriched)} 只)")
+    if hooks.on_enriched is not None:
+        hooks.on_enriched({e.code: e for e in enriched})
+    if hooks.save_kline_cache is not None:
+        hooks.save_kline_cache()
+
     if fallback_snapshot:
         MARKET_WARNINGS.append(
             "备用行情缺少兼容量比、主力资金和行业字段：趋势池仅供观察；"
             "超短池、双池交集、资金优选和低吸买点不会输出。"
         )
     breadth = market_summary(market, total, market_fetch_status)
-    stats = sector_stats(market, breadth)
+    stats = sector_stats(market, breadth, boards=boards_in_use)
 
     # --- capital flow: load history, compute increments, classify ---
     flow_history = load_flow_history()
     has_snapshot = bool(flow_history)
-    apply_flow_increments(enriched, flow_history)
-    for e in enriched:
-        e.flow_status = classify_flow(e, stats, has_snapshot)
-    save_flow_history(enriched, flow_history)
-    print(f"[计时] 资金流向: 历史{'有' if has_snapshot else '无'} ({len(flow_history)} 只)", file=sys.stderr)
-
     latest_ts = max([r.get("f124") or 0 for r in market] or [0])
     ts = datetime.fromtimestamp(latest_ts, TZ) if latest_ts else datetime.now(TZ)
-    after_1420 = ts.hour > 14 or (ts.hour == 14 and ts.minute >= 20)
+    reset_flow_minute_round(ts.strftime("%Y-%m-%d"))
+    apply_flow_increments(enriched, flow_history)
+    # 快照基准缺失时（冷启动/断点重启/隔日首轮）用东财分钟序列补齐，否则资金门槛无法评估。
+    flow_minute_filled = fill_flow_increments_from_fflow(
+        enriched, expected_date=ts.strftime("%Y-%m-%d")
+    )
+    if flow_minute_filled:
+        MARKET_WARNINGS.append(
+            f"本地快照无可用基准，已用东财当日累计分钟序列为 {flow_minute_filled} 只候选补齐 5/15 分钟增量"
+            "（来源 eastmoney_fflow_minutes）；分钟序列不足 15 根时 15 分钟增量仍记基准不足。"
+        )
+    for e in enriched:
+        e.flow_veto = flow_veto_reason(e)
+        e.flow_status = classify_flow(e, stats, has_snapshot)
+    vetoed_codes = sorted({e.code for e in enriched if e.flow_veto})
+    if vetoed_codes:
+        MARKET_WARNINGS.append(
+            "超大单为负（框架一票否决，禁止正式买入建议）：" + "、".join(vetoed_codes)
+        )
+    save_flow_history(enriched, flow_history, hooks.state_commit)
+    hooks.log_line(
+        f"[计时] 资金流向: 历史{'有' if has_snapshot else '无'} ({len(flow_history)} 只)"
+        f"；分钟序列补齐 {flow_minute_filled} 只"
+    )
 
-    strict_ultra_all = [] if fallback_snapshot else sorted([e for e in enriched if strict_ultra(e)], key=lambda e: e.change, reverse=True)
-    strict_ultra_items = strict_ultra_all[:args.top]
-    trend_observation_items = sorted(
+    after_1420 = is_after_tail_risk(ts)
+
+    # ── 完整候选池：排序后保留全量，top 只在最后裁剪展示 ──────────────
+    strict_ultra_all = (
+        []
+        if fallback_snapshot
+        else sorted([e for e in enriched if strict_ultra(e)], key=lambda e: e.change, reverse=True)
+    )
+    trend_observation_all = sorted(
         [e for e in enriched if trend_observation(e)],
         key=lambda e: (not strict_trend(e), -e.change, e.dist60),
-    )[:args.top]
-    strict_trend_items = sorted([e for e in enriched if strict_trend(e)], key=lambda e: e.change, reverse=True)[:args.top]
+    )
+    strict_trend_all = sorted(
+        [e for e in enriched if strict_trend(e)], key=lambda e: e.change, reverse=True
+    )
 
-    class_order = {"A": 0, "B": 1, "C": 2}
-    low_ultra_rows = []
-    low_trend_rows = []
+    strict_ultra_all_rows: List[Dict[str, Any]] = [
+        {**asdict(e), "resonance": "是" if has_resonance(e, stats) else "否"}
+        for e in strict_ultra_all
+    ] if "strict" in modes else []
+    trend_observation_all_rows: List[Dict[str, Any]] = [
+        {
+            **asdict(e),
+            "ma_state": "MA5/10/20上方" if e.price > e.ma5 and e.price > e.ma10 and e.price > e.ma20 else "MA20上方，短均线修复中",
+        }
+        for e in trend_observation_all
+    ] if "strict" in modes else []
+    strict_trend_all_rows: List[Dict[str, Any]] = [
+        asdict(e) for e in strict_trend_all
+    ] if "strict" in modes else []
+    trend_diagnostics = [
+        trend_condition_diagnosis(e, stats) for e in strict_ultra_all
+    ] if "strict" in modes else []
+
+    low_ultra_all_rows: List[Dict[str, Any]] = []
+    low_trend_all_rows: List[Dict[str, Any]] = []
     if "low" in modes and not fallback_snapshot:
         for e in enriched:
-            exclude, reason = _should_exclude_from_low_absorb(e, flow_history)
+            exclude, _reason = _should_exclude_from_low_absorb(e, flow_history)
             if exclude:
                 continue  # 硬黑名单或高位派发降权，不进入低吸候选
             cls, tags, score = low_ultra_class(e, stats, after_1420)
             dom_type, dom_label = evaluate_dominance_type(e, flow_history)
-            if cls != "C" or (e.change >= 2.2 and (e.turnover > 10 or e.change > 5.2 or e.volume_ratio > 6)):
-                low_ultra_rows.append({
+            if low_ultra_output_eligible(e, cls):
+                low_ultra_all_rows.append({
                     **asdict(e),
                     "class": cls,
                     "risk": "/".join(tags) if tags else "无",
@@ -3786,8 +5529,8 @@ def main() -> int:
                     "super_lead": dom_label,
                 })
             cls2, tags2, score2 = low_trend_class(e, stats, after_1420)
-            if cls2 != "C" or (e.change >= 2.5 and (e.change > 6 or e.turnover > 9 or e.ma20_dist > 0.15)):
-                low_trend_rows.append({
+            if low_trend_output_eligible(e, cls2):
+                low_trend_all_rows.append({
                     **asdict(e),
                     "class": cls2,
                     "risk": "/".join(tags2) if tags2 else "无",
@@ -3797,22 +5540,20 @@ def main() -> int:
                     "dominance_label": dom_label,
                     "super_lead": dom_label,
                 })
-        low_ultra_rows = sorted(low_ultra_rows, key=lambda r: (class_order[r["class"]], -r["score"], abs(r["change"] - 3.4)))[: max(args.top, 15)]
-        low_trend_rows = sorted(low_trend_rows, key=lambda r: (class_order[r["class"]], -r["score"], abs(r["change"] - 3.8)))[: max(args.top, 15)]
+        unverified = low_absorb_unverified_count()
+        if unverified:
+            MARKET_WARNINGS.append(
+                f"低吸高位派发核验：{unverified} 只满足高位条件但既无本地快照也无分钟序列，"
+                "派发信号未能核验、按未触发处理，建议人工复查。"
+            )
+        low_ultra_all_rows = sorted(low_ultra_all_rows, key=low_ultra_sort_key)
+        low_trend_all_rows = sorted(low_trend_all_rows, key=low_trend_sort_key)
 
-    strict_ultra_rows = [
-        {**asdict(e), "resonance": "是" if has_resonance(e, stats) else "否"}
-        for e in strict_ultra_items
-    ] if "strict" in modes else []
-    trend_observation_rows = [
-        {**asdict(e), "ma_state": "MA5/10/20上方" if e.price > e.ma5 and e.price > e.ma10 and e.price > e.ma20 else "MA20上方，短均线修复中"}
-        for e in trend_observation_items
-    ] if "strict" in modes else []
-    strict_trend_rows = [asdict(e) for e in strict_trend_items] if "strict" in modes else []
-    trend_diagnostics = [trend_condition_diagnosis(e, stats) for e in strict_ultra_all] if "strict" in modes else []
-    ultra_codes = {r["code"] for r in strict_ultra_rows}
-    observation_codes = {r["code"] for r in trend_observation_rows}
-    confirmation_codes = {r["code"] for r in strict_trend_rows}
+    raw_watchlist = build_watchlist(enriched, stats) if "watchlist" in modes else []
+
+    ultra_codes = {r["code"] for r in strict_ultra_all_rows}
+    observation_codes = {r["code"] for r in trend_observation_all_rows}
+    confirmation_codes = {r["code"] for r in strict_trend_all_rows}
     relaxed_confirm_codes = {e.code for e in enriched if trend_confirm_relaxed(e)}
     enriched_by_code_for_pool = {e.code: e for e in enriched}
 
@@ -3824,14 +5565,13 @@ def main() -> int:
             "resonance": "是" if has_resonance(enriched_by_code_for_pool[r["code"]], stats) else "否",
             "sector_change": (board_by_code_for_pool.get(r.get("industry"), {}) or {}).get("change"),
         }
-        for r in strict_ultra_rows
+        for r in strict_ultra_all_rows
         if r["code"] in relaxed_confirm_codes
     ]
     dual_pool_raw_rows = [dict(r) for r in dual_pool_rows]
 
-    # --- sector indices for relevant industries ---
     relevant_industries: set = set()
-    for r in strict_ultra_rows + trend_observation_rows + strict_trend_rows:
+    for r in strict_ultra_all_rows + trend_observation_all_rows + strict_trend_all_rows:
         ind = r.get("industry", "")
         if ind and ind != "-":
             relevant_industries.add(ind)
@@ -3855,7 +5595,9 @@ def main() -> int:
                 "source": "筛选",
             })
 
-    intersection_config, intersection_config_meta = resolve_intersection_config(load_intersection_calibration())
+    intersection_config, intersection_config_meta = resolve_intersection_config(
+        load_intersection_calibration()
+    )
     intersection_runtime_config = {
         **intersection_config,
         "version": intersection_config_meta["version"],
@@ -3864,20 +5606,36 @@ def main() -> int:
 
     diag_by_code = {d["code"]: d for d in trend_diagnostics} if "strict" in modes else {}
     pre_intersection_rows = (
-        compute_pre_intersection(strict_ultra_rows, relaxed_confirm_codes, diag_by_code, intersection_runtime_config)
+        compute_pre_intersection(
+            strict_ultra_all_rows, relaxed_confirm_codes, diag_by_code, intersection_runtime_config
+        )
         if "strict" in modes else []
     )
 
-    raw_watchlist = build_watchlist(enriched, stats) if "watchlist" in modes else []
+    # 范围结论：区分「未符合条件」与「数据不可用」（与引擎共用同一判定）。
+    # 候选数读**完整**内部集合，不能被 top 截短（否则 top 小的时候会误报"无候选"）。
+    board_scope_status = board_scope_status_for(fallback_snapshot, market_fetch_status)
+    board_scope_candidates = len({
+        str(row.get("code"))
+        for rows in (
+            strict_ultra_all_rows, trend_observation_all_rows, strict_trend_all_rows,
+            low_ultra_all_rows, low_trend_all_rows, raw_watchlist,
+        )
+        for row in (rows or [])
+        if row.get("code")
+    })
 
-    result = {
+    extra_meta = hooks.extra_meta
+    if callable(extra_meta):
+        extra_meta = extra_meta()
+    result: Dict[str, Any] = {
         "meta": {
             "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
             "status": current_status(ts),
             "source": (
                 "新浪财经实时备用快照（字段降级）"
                 if fallback_snapshot else "东方财富push2实时/快照"
-            ) + " + 腾讯/东方财富日K" + ("" if args.skip_announcements else " + 东方财富公告"),
+            ) + " + " + kline_source_summary(enriched) + hooks.source_suffix,
             "total_rows": len(market),
             "provider_total": total,
             "market_fetch_complete": market_fetch_status.get("complete"),
@@ -3885,6 +5643,15 @@ def main() -> int:
             "enriched_rows": len(enriched),
             "elapsed_seconds": round(time.time() - t0, 1),
             "market_data_degraded": fallback_snapshot,
+            # 交易板范围：本轮实际筛选范围（只决定筛哪些股票供观察，不授予买入资格）
+            "enabled_boards": list(boards_in_use),
+            "enabled_boards_label": " + ".join(BOARD_LABELS.get(b, b) for b in boards_in_use),
+            "board_counts": {
+                "market": count_by_board(market),
+                "prefetch": count_by_board(prefetch),
+                "strict_rows": count_by_board(enriched),
+            },
+            **(extra_meta or {}),
         },
         "breadth": breadth,
         "market_fetch_status": market_fetch_status,
@@ -3892,10 +5659,14 @@ def main() -> int:
         "errors": errors,
         "warnings": MARKET_WARNINGS,
         "announcement_errors": [],
+        "board_scope_status": board_scope_status,
+        "board_scope_candidates": board_scope_candidates,
+        "board_scope_note": board_scope_note(board_scope_status, boards_in_use, board_scope_candidates),
         "strict_enabled": "strict" in modes,
-        "strict_ultra": strict_ultra_rows,
-        "trend_observation": trend_observation_rows,
-        "strict_trend": strict_trend_rows,
+        # 以下候选池在公告核验期间保持全量；展示裁剪在函数末尾统一进行。
+        "strict_ultra": strict_ultra_all_rows,
+        "trend_observation": trend_observation_all_rows,
+        "strict_trend": strict_trend_all_rows,
         "trend_diagnostics": trend_diagnostics,
         "dual_pool": dual_pool_rows,
         "dual_pool_raw": dual_pool_raw_rows,
@@ -3904,28 +5675,41 @@ def main() -> int:
         "intersection_config": intersection_runtime_config,
         "intersection_config_meta": intersection_config_meta,
         "capital_rank": [],
-        "low_ultra": low_ultra_rows if "low" in modes and not fallback_snapshot else [],
-        "low_trend": low_trend_rows if "low" in modes and not fallback_snapshot else [],
+        "low_ultra": low_ultra_all_rows,
+        "low_trend": low_trend_all_rows,
         "watchlist": raw_watchlist,
         "sector_indices": sector_indices,
         "has_snapshot": has_snapshot,
+        "flow_minute_filled": flow_minute_filled,
         "low_open_wash": low_open_wash_rows(enriched, flow_history),
     }
+
+    # 看板专有列表（负超单观察等）在公告核验前并入，确保它们与正式池读到同一份风险结果。
+    if hooks.build_extras is not None:
+        extras = hooks.build_extras(
+            enriched=enriched,
+            stats=stats,
+            flow_history=flow_history,
+            ts=ts,
+            fallback_snapshot=fallback_snapshot,
+            market_fetch_status=market_fetch_status,
+        )
+        if extras:
+            result.update(extras)
 
     # --- flow detail for key candidates (strict top 5 + low A-class top 5 + holdings) ---
     detail_codes: set = set()
     flow_detail: List[Dict[str, Any]] = []
-    for e in (strict_ultra_items[:5] + trend_observation_items[:5] + strict_trend_items[:5]):
+    for e in (strict_ultra_all[:5] + trend_observation_all[:5] + strict_trend_all[:5]):
         if e.code not in detail_codes:
             detail_codes.add(e.code)
             flow_detail.append(asdict(e))
-    for r in low_ultra_rows if "low" in modes else []:
+    for r in low_ultra_all_rows if "low" in modes else []:
         if r.get("class") == "A" and r["code"] not in detail_codes:
             detail_codes.add(r["code"])
             flow_detail.append(r)
             if len([d for d in flow_detail if d.get("class") == "A"]) >= 5:
                 break
-    # Add holdings to flow detail
     holdings_file = SCRIPT_DIR / "holdings.json"
     enriched_by_code = {e.code: e for e in enriched}
     try:
@@ -3945,29 +5729,21 @@ def main() -> int:
     result["flow_detail"] = flow_detail
 
     # --- 公告风控查询与统一门槛处理 ---
-    if not args.skip_announcements:
+    if not params.skip_announcements:
         t_ann_start = time.time()
-        def announcement_progress(done: int, total: int, code: str, status: str, source: str) -> None:
-            source_label = "缓存" if source == "cache" else "查询"
-            print(f"[公告] {done}/{total} {code} {source_label}={status}", file=sys.stderr, flush=True)
-
         result["announcement_errors"] = attach_announcement_risks(
             result,
-            args.announcement_page_size,
-            args.workers,
-            progress_callback=announcement_progress,
+            params.announcement_page_size,
+            params.workers,
+            progress_callback=hooks.announce_progress,
         )
         apply_announcement_pool_gates(result)
-        t_ann = time.time() - t_ann_start
-        print(f"[计时] 公告检查: {t_ann:.1f}s", file=sys.stderr)
+        hooks.log_line(f"[计时] 公告检查: {time.time() - t_ann_start:.1f}s")
     else:
         result["announcement_check_available"] = False
         result["announcement_unknown_codes"] = sorted({
             str(row.get("code"))
-            for section in (
-                "strict_ultra", "trend_observation", "strict_trend", "dual_pool", "dual_pool_raw",
-                "trend_diagnostics", "low_ultra", "low_trend", "watchlist",
-            )
+            for section in ANNOUNCEMENT_SECTIONS
             for row in (result.get(section) or [])
             if _row_risk_status(row) == RISK_UNKNOWN
         })
@@ -3975,36 +5751,32 @@ def main() -> int:
 
     # 汇总统一公告风控字典。公告查询结果是唯一权威来源；其它池子只
     # 用来补齐查询结果缺失的代码，且缺失状态一律 unknown（fail-closed）。
-    valid_risk_statuses = RISK_STATUS_VALUES
     risk_map: Dict[str, str] = {
-        str(code): (status if isinstance(status, str) and status in valid_risk_statuses else RISK_UNKNOWN)
+        str(code): (status if isinstance(status, str) and status in RISK_STATUS_VALUES else RISK_UNKNOWN)
         for code, status in (result.get("announcement_risk_map") or {}).items()
         if code
     }
-    for section in (
-        "watchlist", "strict_ultra", "trend_observation", "strict_trend", "dual_pool",
-        "dual_pool_raw", "pre_intersection", "capital_rank", "trend_diagnostics",
-        "low_ultra", "low_trend", "low_open_wash",
-    ):
+    for section in ANNOUNCEMENT_SECTIONS:
         for row in (result.get(section) or []):
             code = str(row.get("code") or "")
             if code:
                 risk_map.setdefault(code, _row_risk_status(row))
 
-    # 将确切的公告风控状态同步赋给 Enriched 实例
+    # 将确切的公告风控状态同步赋给 Enriched 实例（资金排名读它判 clean 加分）。
     for e in enriched:
         e.risk_status = risk_map.get(e.code, RISK_UNKNOWN)
 
     # --- 在公告检查之后统一执行主力资金优选排序（确保 clean 硬门槛生效） ---
+    # 候选集合读**完整**内部池；avoid/unknown 一票否决不进排名，watch_risk 保留。
     strict_candidate_codes = {
         r["code"]
         for r in (result.get("strict_ultra") or []) + (result.get("trend_observation") or [])
-        if _row_risk_status(r) not in {RISK_AVOID, RISK_UNKNOWN}
+        if not risk_blocks_formal_qualification(_row_risk_status(r))
     }
-    capital_rank = [] if args.skip_capital_ranking or fallback_snapshot else rank_capital_candidates(
+    capital_rank_full = [] if params.skip_capital_ranking or fallback_snapshot else rank_capital_candidates(
         [e for e in enriched if e.code in strict_candidate_codes], stats, flow_history
-    )[:args.top]
-    for row in capital_rank:
+    )
+    for row in capital_rank_full:
         in_ultra = row["code"] in ultra_codes
         in_observation = row["code"] in observation_codes
         in_confirmation = row["code"] in confirmation_codes
@@ -4014,18 +5786,22 @@ def main() -> int:
             row["pool_source"] = "超短池"
         else:
             row["pool_source"] = "趋势确认池" if in_confirmation else "趋势观察池"
-    result["capital_rank"] = capital_rank
+    result["capital_rank"] = capital_rank_full
     # capital_rank 是公告查询完成后新生成的派生池，必须再次走同一套
     # fail-closed 门槛，避免 avoid/unknown 通过重新排名重新出现。
     apply_announcement_pool_gates(result)
 
     # 观察池构建与突破状态机评估（在公告检查之后执行，接入真实风控）
+    # 持仓代码只用于状态剔除时保留监控（取消交易板不等于停止监控已持仓）
+    holding_codes = load_holding_codes()
     wl_state_payload = load_watchlist_breakout_state()
-    prev_wl_items = wl_state_payload.get("items") or {}
+    prev_wl_items = prune_state_by_boards(
+        wl_state_payload.get("items") or {}, boards_in_use, holding_codes
+    )
     is_today = (wl_state_payload.get("date") == ts.strftime("%Y-%m-%d"))
     if not is_today and prev_wl_items:
         # 跨日：保留昨日设定的触发价基准，重置日内确认计数为0
-        for code, itm in prev_wl_items.items():
+        for _code, itm in prev_wl_items.items():
             itm["confirm_count"] = 0
             itm["phase"] = "WATCHING"
             itm["breakout_class"] = "WATCHING"
@@ -4033,26 +5809,116 @@ def main() -> int:
         raw_watchlist, enriched_by_code_for_pool, stats, flow_history, prev_wl_items, ts, risk_map
     )
     result["watchlist"] = watchlist_evaluated
-    save_watchlist_breakout_state(next_wl_items, ts.strftime("%Y-%m-%d"))
+    save_watchlist_breakout_state(next_wl_items, ts.strftime("%Y-%m-%d"), hooks.state_commit)
 
     if result.get("strict_enabled"):
         state_payload = load_intersection_state()
-        previous_items = state_payload.get("items") or {}
+        previous_items = prune_state_by_boards(
+            state_payload.get("items") or {}, boards_in_use, holding_codes
+        )
         if state_payload.get("date") != ts.strftime("%Y-%m-%d"):
             previous_items = {}
+        minute_map: Dict[str, Dict[str, Any]] = {}
+        if hooks.minute_map_provider is not None and not fallback_snapshot:
+            try:
+                minute_map = hooks.minute_map_provider(result, previous_items) or {}
+            except Exception as exc:  # noqa: BLE001
+                result.setdefault("warnings", []).append(f"状态机分钟线拉取失败：{exc}")
+        # 市场环境分级（宽度/指数极端）在核心内统一计算：CLI 与看板必须用同一
+        # 口径判定 NORMAL/LIGHT/DOWNGRADE/CASH，CASH 一律禁止新开仓。
+        market_context = resolve_market_mode(
+            breadth, result.get("indices") or [], intersection_runtime_config
+        )
+        result["market_context"] = market_context
         state_rows, next_items = evaluate_intersection_states(
             result.get("dual_pool_raw") or [],
             result.get("pre_intersection") or [],
             previous_items,
             ts,
             intersection_runtime_config,
+            snapshot_id=hooks.snapshot_id or ts.strftime("%Y-%m-%d %H:%M:%S"),
             risk_map=risk_map,
+            minute_map=minute_map,
+            market_context=market_context,
         )
         result["intersection_states"] = state_rows
-        save_intersection_state(next_items, ts.strftime("%Y-%m-%d"))
+        if minute_map:
+            result["minute_fetch_log"] = minute_map
+        save_intersection_state(next_items, ts.strftime("%Y-%m-%d"), hooks.state_commit)
 
-    t_total = time.time() - t0
-    print(f"[计时] 总计: {t_total:.1f}s", file=sys.stderr)
+    # ── 展示裁剪：top 至此才生效，只改变可见行数 ──────────────────────
+    result["strict_ultra"] = _display_rows(result.get("strict_ultra"), params.top)
+    result["trend_observation"] = _display_rows(result.get("trend_observation"), params.top)
+    result["strict_trend"] = _display_rows(result.get("strict_trend"), params.top)
+    result["low_ultra"] = _display_rows(result.get("low_ultra"), max(params.top, 15))
+    result["low_trend"] = _display_rows(result.get("low_trend"), max(params.top, 15))
+    result["capital_rank"] = _display_rows(result.get("capital_rank"), params.top)
+
+    # 每行标注交易板（三板同表时必须可辨）。放在最后：资金优选、交集状态机、
+    # 观察池突破升级后的观察池都是在此之后才生成的派生栏目，早标注会漏掉它们。
+    stamp_board_fields(result)
+    result["meta"]["elapsed_seconds"] = round(time.time() - t0, 1)
+    hooks.log_line(f"[计时] 总计: {result['meta']['elapsed_seconds']:.1f}s")
+    return result
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="A-share screening query helper for daily-stock-analysis")
+    parser.add_argument("--mode", nargs="+", choices=["all", "strict", "low", "watchlist"], default=["strict"], help="screening modules to output (default: original dual screen)")
+    parser.add_argument("--format", choices=["md", "json"], default="md", help="output format")
+    parser.add_argument("--workers", type=int, default=6, help="concurrent K-line workers")
+    parser.add_argument("--top", type=int, default=10, help="max display rows per section")
+    parser.add_argument("--save", type=Path, help="also save output to file")
+    parser.add_argument("--skip-announcements", action="store_true", help="skip latest-announcement risk check")
+    parser.add_argument("--skip-capital-ranking", action="store_true", help="skip capital-flow secondary ranking")
+    parser.add_argument("--announcement-page-size", type=int, default=8, help="latest announcement rows per stock")
+    parser.add_argument("--network-mode", choices=["auto", "direct", "proxy"], default="auto",
+                        help="network mode: auto (measured fastest) / direct / proxy")
+    parser.add_argument("--boards", nargs="+", choices=list(BOARD_ORDER), default=[BOARD_MAIN],
+                        help="交易板范围（默认 main=仅沪深主板）。可任意非空组合；所选交易板"
+                             "统一参与完整筛选（同一门槛/排名/状态机）。未勾选的交易板不进入新增候选。"
+                             "本参数只决定筛选范围，不授予任何买入资格。")
+    args = parser.parse_args()
+
+    modes = set(args.mode)
+    if "all" in modes:
+        modes = {"strict", "low", "watchlist"}
+
+    params = ScreeningParams(
+        modes=frozenset(modes),
+        workers=args.workers,
+        top=args.top,
+        skip_announcements=args.skip_announcements,
+        skip_capital_ranking=args.skip_capital_ranking,
+        network_mode=args.network_mode,
+        announcement_page_size=args.announcement_page_size,
+        enabled_boards=tuple(args.boards),
+    )
+
+    def announcement_progress(done: int, total: int, code: str, status: str, source: str) -> None:
+        source_label = "缓存" if source == "cache" else "查询"
+        print(f"[公告] {done}/{total} {code} {source_label}={status}", file=sys.stderr, flush=True)
+
+    hooks = ScreeningHooks(
+        announce_progress=announcement_progress,
+        source_suffix="" if args.skip_announcements else " + 东方财富公告",
+        log=lambda message: print(message, file=sys.stderr),
+    )
+
+    try:
+        result = run_screening_core(params, hooks)
+    except NetworkUnavailable as exc:
+        print(format_network_failure(exc), file=sys.stderr)
+        return 2
+
+    # 背景数据在核心筛选、公告门禁和状态机完成后按独立缓存请求；任何失败只
+    # 影响报告顶部证据，不改变候选池、排序或状态提交语义。
+    try:
+        result["market_background"] = build_market_background(
+            (result.get("meta") or {}).get("timestamp", "")[:10] or None
+        )
+    except Exception as exc:
+        result.setdefault("warnings", []).append(f"市场背景查询失败：{type(exc).__name__}: {exc}")
 
     if args.format == "json":
         output = json.dumps(_sanitize_for_json(result), ensure_ascii=False, indent=2)

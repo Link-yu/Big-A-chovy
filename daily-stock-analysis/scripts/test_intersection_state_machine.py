@@ -172,7 +172,7 @@ class MinuteFreshnessTests(unittest.TestCase):
 
 
 class RiskMapTests(unittest.TestCase):
-    """需求2：统一 risk_map；watch_risk 不新开仓；unknown 否决。"""
+    """需求2：统一 risk_map；watch_risk 仅减分，avoid/unknown 一票否决。"""
 
     def _entry_rows(self, risk_map):
         _, state = run([inter_row(price=10.0, high=10.0)], [], {}, at(10, 0),
@@ -181,15 +181,28 @@ class RiskMapTests(unittest.TestCase):
                        risk=risk_map, minute={"000001": fresh_min(vol=4000, close=9.9, vwap=9.85)})
         _, state = run([inter_row(price=9.9, high=10.0)], [], state, at(10, 4),
                        risk=risk_map, minute={"000001": fresh_min(vol=4000, close=9.9, vwap=9.85)})
-        rows, state = run([inter_row(price=9.9, high=10.0)], [], state, at(10, 6),
-                          risk=risk_map, minute={"000001": fresh_min(vol=4000, close=9.9, vwap=9.85)})
+        rows, state = run([inter_row(price=9.92, high=10.0)], [], state, at(10, 6),
+                          risk=risk_map, minute={"000001": fresh_min(vol=4000, close=9.92, vwap=9.86)})
         return rows, state
 
-    def test_watch_risk_blocks_entry(self):
+    def test_watch_risk_keeps_state_qualification_with_soft_note(self):
+        """框架：watch_risk 仅减分不否决，其它条件满足时可推进到 ENTRY_ELIGIBLE。"""
         rows, state = self._entry_rows({"000001": "watch_risk"})
-        self.assertNotEqual(phase_of(state, "000001"), PHASE_ENTRY)
-        self.assertFalse(rows[0]["new_entry_allowed"])
-        self.assertIn("公告风险", rows[0]["entry_block_reason"])
+        self.assertEqual(phase_of(state, "000001"), PHASE_ENTRY)
+        self.assertTrue(rows[0]["new_entry_allowed"])
+        self.assertTrue(rows[0]["new_open_eligible"])
+        # 软风险标注保留，且不得被写成“仅观察/不给资格”
+        self.assertIn("watch_risk", rows[0]["risk_note"])
+        self.assertIn("仅减分", rows[0]["risk_note"])
+
+    def test_hard_veto_blocks_entry(self):
+        """avoid/unknown 一票否决：不得推进到 ENTRY_ELIGIBLE。"""
+        for risk in ("avoid", "unknown"):
+            with self.subTest(risk=risk):
+                rows, state = self._entry_rows({"000001": risk})
+                self.assertNotEqual(phase_of(state, "000001"), PHASE_ENTRY)
+                self.assertFalse(rows[0]["new_entry_allowed"])
+                self.assertIn(risk, rows[0]["entry_block_reason"])
 
     def test_missing_risk_is_unknown_and_blocks(self):
         rows, _ = self._entry_rows({})   # 无 risk_map 且行内无风险字段 → unknown
